@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # scripts/test_all.py builds the real image, starts Postgres, runs the
+      # full pytest suite inside the container, then smoke-tests the running
+      # container over real HTTP — no external HubSpot/Google credentials
+      # required for any of that, only a locally-generated encryption key.
+      - name: Prepare .env
+        run: |
+          cp .env.example .env
+          FERNET_KEY=$(python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          sed -i "s|^APP_ENCRYPTION_KEY=.*|APP_ENCRYPTION_KEY=${FERNET_KEY}|" .env
+
+      - name: Run full test suite (scripts/test_all.py)
+        run: python3 scripts/test_all.py
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
