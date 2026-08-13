@@ -1,0 +1,83 @@
+networks:
+  mcp-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+
+services:
+  # ====================================
+  # Postgres (token vault, cache, locks, rate limiting, audit log)
+  # ====================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: mcp-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-mcp}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mcp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ====================================
+  # HubSpot MCP Server
+  # ====================================
+
+  mcp-gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: mcp-gateway
+    ports:
+      - "${GATEWAY_PORT:-8888}:8888"
+    environment:
+      GATEWAY_MODE: ${GATEWAY_MODE:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PORT: 8888
+      HUBSPOT_APP_CLIENT_ID: ${HUBSPOT_APP_CLIENT_ID}
+      HUBSPOT_APP_CLIENT_SECRET: ${HUBSPOT_APP_CLIENT_SECRET}
+      HUBSPOT_REDIRECT_URI: ${HUBSPOT_REDIRECT_URI}
+      HUBSPOT_SCOPES: ${HUBSPOT_SCOPES}
+      HUBSPOT_MCP_CLIENT_ID: ${HUBSPOT_MCP_CLIENT_ID}
+      HUBSPOT_MCP_CLIENT_SECRET: ${HUBSPOT_MCP_CLIENT_SECRET}
+      HUBSPOT_MCP_REDIRECT_URI: ${HUBSPOT_MCP_REDIRECT_URI}
+      FASTMCP_GOOGLE_CLIENT_ID: ${FASTMCP_GOOGLE_CLIENT_ID}
+      FASTMCP_GOOGLE_CLIENT_SECRET: ${FASTMCP_GOOGLE_CLIENT_SECRET}
+      FASTMCP_BASE_URL: ${FASTMCP_BASE_URL:-http://localhost:8888/mcp}
+      FASTMCP_OAUTH_REDIRECT_URI: ${FASTMCP_OAUTH_REDIRECT_URI}
+      FASTMCP_ALLOWED_GOOGLE_DOMAINS: ${FASTMCP_ALLOWED_GOOGLE_DOMAINS}
+      FASTMCP_ACCESS_TOKEN_TTL_MINUTES: ${FASTMCP_ACCESS_TOKEN_TTL_MINUTES:-30}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_HOSTED_DOMAIN: ${GOOGLE_HOSTED_DOMAIN}
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID}
+      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID}
+      DATABASE_URL: ${DATABASE_URL}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-60}
+      AIRTABLE_SERVICE_ACCOUNT: ${AIRTABLE_SERVICE_ACCOUNT}
+      AIRTABLE_API_KEY: ${AIRTABLE_API_KEY}
+      AIRTABLE_BASE_ID: ${AIRTABLE_BASE_ID}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-60}
+      SYBILL_WEBHOOK: ${SYBILL_WEBHOOK}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8888/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

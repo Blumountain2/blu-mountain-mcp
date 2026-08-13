@@ -1,0 +1,306 @@
+"""Live interactive session: FastMCP's OAuth Proxy (GoogleProvider) wrapping
+one manually registered Google Workspace OAuth client.
+
+Works identically from any MCP client that speaks the standard MCP
+authorization flow — Claude Desktop, Claude Code, or Claude Cowork; nothing
+here is specific to any one of them.
+
+FastMCP issues its own audience-scoped JWT (token factory pattern) to the
+connecting client; Google's own token never leaves the proxy, this is what
+satisfies the no-token-passthrough non-negotiable for this path.
+
+Every tool enforces, in order: the Google Workspace domain allowlist,
+default-open tenant access (every staff member who signs in successfully
+has access to every installed tenant unless explicitly restricted from one
+via staff_tenant_restrictions), and (when a staff member has more than one
+permitted tenant) an explicit tenant selection, before any HubSpot data is
+returned. Every access is audited by staff identity and tenant.
+"""
+
+import asyncio
+
+import structlog
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.google import GoogleProvider
+from fastmcp.server.dependencies import get_access_token
+
+from auth import mcp_vault, record_audit
+from config import settings
+from db import get_pool
+from sync import HubSpotDataPullClient
+from sync.hubspot_client import (
+    CRM_OBJECT_ALIASES,
+    CRM_OBJECT_TYPES,
+    GENERIC_TOOL_QUERY_ALIASES,
+    PER_ITEM_TOOLS,
+)
+
+logger = structlog.get_logger()
+
+
+class NotAllowedDomain(Exception):
+    pass
+
+
+class NoPermittedTenants(Exception):
+    pass
+
+
+class TenantSelectionRequired(Exception):
+    pass
+
+
+class TenantNotPermitted(Exception):
+    pass
+
+
+def _build_auth() -> GoogleProvider:
+    return GoogleProvider(
+        client_id=settings.fastmcp_google_client_id,
+        client_secret=settings.fastmcp_google_client_secret,
+        base_url=settings.fastmcp_base_url,
+        required_scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
+    )
+
+
+mcp = FastMCP("Blu Mountain Live Session", auth=_build_auth())
+
+
+async def _require_staff_identity() -> tuple[str, str]:
+    """Returns (email, session_key) after enforcing the domain allowlist.
+    session_key is the issued token's JTI, stable for this session's lifetime.
+    Both email and domain use `.get(key) or ""` rather than `.get(key, "")`
+    — the default in `.get(key, "")` only applies when the key is *absent*;
+    a claim present with value None (a real possibility depending on the
+    upstream token issuer) would otherwise reach `.lower()` and raise
+    AttributeError, turning what should be a clean NotAllowedDomain
+    rejection into an unhandled crash.
+
+    Both are lowercased here, once, at the only place a staff_identity value
+    ever originates in this system — so every downstream comparison
+    (staff_tenant_restrictions, audit_log, live_session_selection,
+    allowed_google_domains_list) is consistent regardless of the casing
+    Google's claim, a hand-typed SQL restriction, or
+    FASTMCP_ALLOWED_GOOGLE_DOMAINS happen to use. Under the default-open
+    model an email casing mismatch would otherwise fail open (an intended
+    restriction silently not applying); a domain casing mismatch would
+    instead fail closed (a legitimate staff member wrongly rejected) — both
+    are bugs, just in different directions.
+
+    An empty/unconfigured allowlist fails closed (rejects everyone), not
+    open (allows everyone) — under the old allow-list model a blank
+    FASTMCP_ALLOWED_GOOGLE_DOMAINS was harmless, since a stranger still had
+    no grant row; under default-open, this domain check is the *only* gate,
+    so the safe default when it's misconfigured is to admit no one, not
+    everyone."""
+    token = get_access_token()
+    email = (token.claims.get("email") or "").lower()
+    domain = (token.claims.get("hd") or "").lower()
+    allowed = settings.allowed_google_domains_list
+
+    if not allowed or domain not in allowed:
+        logger.warning("live_session.domain_rejected", domain=domain)
+        await record_audit(
+            "live_domain_rejected", staff_identity=email, detail={"domain": domain}
+        )
+        raise NotAllowedDomain(f"Domain '{domain}' is not on the allowlist")
+
+    session_key = token.claims.get("jti") or token.token
+    return email, session_key
+
+
+async def _permitted_tenants(staff_identity: str) -> list[str]:
+    """Every installed tenant, minus any explicitly restricted for this staff
+    member, in a single query — not the shared get_installed_hub_ids() (used
+    by the once-per-cycle scheduled sync) plus a second restrictions query,
+    since this runs on every live-session tool call and the extra round
+    trip matters here in a way it doesn't for the sync job. This
+    deliberately re-states the install_status = 'installed' predicate
+    that get_installed_hub_ids() also has, trading that narrow duplication
+    for one fewer Postgres round trip on the hot path. staff_identity is
+    already lowercased by the caller (_require_staff_identity); LOWER() on
+    the stored column is the other half of that guarantee — a restriction
+    row hand-typed with different casing must still match, not silently
+    fail open just because the comparison itself was case-sensitive."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT hub_id FROM tenants
+        WHERE install_status = 'installed'
+          AND hub_id NOT IN (
+              SELECT hub_id FROM staff_tenant_restrictions WHERE LOWER(staff_identity) = $1
+          )
+        """,
+        staff_identity,
+    )
+    return [row["hub_id"] for row in rows]
+
+
+async def _deny_tenant_access(staff_identity: str, hub_id: str, reason: str) -> None:
+    """Logs and audits a denied tenant-access attempt, then raises
+    TenantNotPermitted. Shared by every path that rejects a specific
+    hub_id, so the audit trail (the system's only record attributing a
+    HubSpot read, or an attempt at one, to a specific person) can't
+    silently drift between call sites."""
+    logger.warning("live_session.tenant_access_denied", staff=staff_identity, hub_id=hub_id)
+    await record_audit(
+        "live_tenant_access_denied",
+        hub_id=hub_id,
+        staff_identity=staff_identity,
+        detail={"reason": reason},
+    )
+    raise TenantNotPermitted(f"{staff_identity} is not permitted to access {hub_id}")
+
+
+async def _persist_tenant_selection(staff_identity: str, session_key: str, hub_id: str) -> None:
+    """Writes the selection with no re-validation — callers must already
+    have confirmed hub_id is in this staff member's permitted set, so the
+    auto-select path (which just computed that set) doesn't pay for
+    re-deriving and re-checking it a second time via select_tenant_internal."""
+    pool = await get_pool()
+    await pool.execute(
+        """
+        INSERT INTO live_session_selection (session_id, staff_identity, selected_hub_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (session_id) DO UPDATE SET selected_hub_id = EXCLUDED.selected_hub_id
+        """,
+        session_key,
+        staff_identity,
+        hub_id,
+    )
+
+
+async def _resolve_selected_tenant(staff_identity: str, session_key: str) -> str:
+    """Returns the tenant selected for this session, auto-selecting when the
+    staff member has exactly one permitted tenant, else requiring an explicit
+    prior call to select_tenant(). Re-checks a cached selection against the
+    current permitted set every time, not just at selection time — a
+    restriction added mid-session must take effect on the very next query,
+    not silently be ignored because a selection was already cached.
+    _permitted_tenants and the cached-selection lookup are independent reads,
+    gathered concurrently rather than awaited back to back."""
+    pool = await get_pool()
+    permitted, row = await asyncio.gather(
+        _permitted_tenants(staff_identity),
+        pool.fetchrow(
+            "SELECT selected_hub_id FROM live_session_selection WHERE session_id = $1",
+            session_key,
+        ),
+    )
+    if not permitted:
+        logger.warning("live_session.no_permitted_tenants", staff=staff_identity)
+        await record_audit("live_no_permitted_tenants", staff_identity=staff_identity, detail={})
+        raise NoPermittedTenants(f"{staff_identity} has no permitted tenants")
+
+    if row and row["selected_hub_id"]:
+        selected_hub_id = row["selected_hub_id"]
+        if selected_hub_id not in permitted:
+            await _deny_tenant_access(staff_identity, selected_hub_id, "restricted_mid_session")
+        return selected_hub_id
+
+    if len(permitted) == 1:
+        await _persist_tenant_selection(staff_identity, session_key, permitted[0])
+        return permitted[0]
+
+    raise TenantSelectionRequired(
+        "More than one tenant is permitted; call select_tenant first"
+    )
+
+
+async def select_tenant_internal(staff_identity: str, session_key: str, hub_id: str) -> None:
+    permitted = await _permitted_tenants(staff_identity)
+    if hub_id not in permitted:
+        await _deny_tenant_access(staff_identity, hub_id, "explicit_selection_not_permitted")
+
+    await _persist_tenant_selection(staff_identity, session_key, hub_id)
+
+
+async def _audit(staff_identity: str, hub_id: str, event_type: str, detail: dict) -> None:
+    await record_audit(event_type, hub_id=hub_id, staff_identity=staff_identity, detail=detail)
+
+
+@mcp.tool
+async def list_my_tenants() -> list[str]:
+    """Lists the client tenants this staff member is permitted to query."""
+    email, _session_key = await _require_staff_identity()
+    tenants = await _permitted_tenants(email)
+    await _audit(email, None, "live_tenants_listed", {"tenant_count": len(tenants)})
+    return tenants
+
+
+@mcp.tool
+async def select_tenant(hub_id: str) -> dict:
+    """Selects one tenant for this session. Required when more than one
+    tenant is permitted; not needed if only one tenant is permitted."""
+    email, session_key = await _require_staff_identity()
+    await select_tenant_internal(email, session_key, hub_id)
+    await _audit(email, hub_id, "live_tenant_selected", {})
+    return {"selected_hub_id": hub_id}
+
+
+@mcp.tool
+async def query_hubspot_data(object_type: str) -> dict:
+    """Returns read-only HubSpot data for the session's selected tenant,
+    for one in-scope object type (e.g. 'contacts', 'deals', 'campaign').
+
+    Matches against all three of sync/hubspot_client.py's read paths, not
+    just its generic per-object tools: the core CRM object set (contacts,
+    deals, companies, etc.) has no per-object tool at all and is only
+    reachable via query_crm_data/CRM_OBJECT_TYPES, and campaign metrics
+    always need pull_campaign_data()'s per-campaign-ID handling rather than
+    a bare call to read_campaign_data (which requires an ID this tool
+    never has). Missing either path here previously meant this tool
+    silently returned nothing for the objects staff would ask for most, or
+    crashed outright on a campaign query."""
+    email, session_key = await _require_staff_identity()
+    hub_id = await _resolve_selected_tenant(email, session_key)
+
+    client = HubSpotDataPullClient(hub_id)
+    lowered = object_type.lower()
+    result: dict = {}
+
+    # One shared connection for the whole query, mirroring pull_all()'s own
+    # connection-reuse — a single interactive query can otherwise trigger
+    # a CRM-type call, a campaign lookup, several per-campaign metric
+    # calls, and a tool-discovery call, each opening its own connection.
+    access_token = await mcp_vault.get_access_token(hub_id)
+    mcp_client = await client._client(access_token)
+
+    async with mcp_client:
+        # CRM_OBJECT_ALIASES handles irregular plurals/compound names a
+        # bare substring check misses ("companies" vs "COMPANY", "landing
+        # pages" vs "LANDING_PAGE") — see hubspot_client.py for why.
+        matching_crm_types = [
+            t for t in CRM_OBJECT_TYPES if lowered in CRM_OBJECT_ALIASES.get(t, set())
+        ]
+        if matching_crm_types:
+            result.update(
+                await client.pull_crm_objects(client=mcp_client, object_types=matching_crm_types)
+            )
+
+        if lowered in CRM_OBJECT_ALIASES["CAMPAIGN"]:
+            result["campaign_data"] = await client.pull_campaign_data(client=mcp_client)
+
+        # "team"/"teams" has no CRM_OBJECT_TYPES entry — its only real path
+        # is get_organization_details, matched here via the same
+        # organization-means-teams translation hubspot_client.py's own
+        # IN_SCOPE_OBJECT_KEYWORDS already relies on for the scheduled pull.
+        query_term = GENERIC_TOOL_QUERY_ALIASES.get(lowered, lowered)
+        tools = await client.list_read_only_tools(client=mcp_client)
+        matching_tools = [
+            t for t in tools if query_term in t.lower() and t not in PER_ITEM_TOOLS
+        ]
+
+        async def _pull_tool(tool_name: str) -> tuple[str, object]:
+            try:
+                return tool_name, await client.pull_object(tool_name, client=mcp_client)
+            except Exception as exc:
+                client.log_pull_failure(tool_name, exc)
+                return tool_name, {"error": "pull_failed"}
+
+        tool_pairs = await asyncio.gather(*(_pull_tool(t) for t in matching_tools))
+        result.update(dict(tool_pairs))
+
+    await _audit(email, hub_id, "live_query", {"object_type": object_type})
+    logger.info("live_session.query", staff=email, hub_id=hub_id, object_type=object_type)
+    return result

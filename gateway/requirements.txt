@@ -1,0 +1,37 @@
+# HubSpot MCP Server Python Dependencies
+
+# Web Framework
+fastapi>=0.104.0,<1.0.0
+uvicorn[standard]>=0.24.0,<1.0.0
+
+# HTTP Client
+httpx>=0.25.0,<1.0.0
+
+# MCP client and server (HubSpot pull in client mode, Cowork session via OAuth Proxy in server mode)
+fastmcp>=0.2.0
+
+# Direct Google/Microsoft JWT verification (separate staff/owner auth path)
+pyjwt[crypto]>=2.8.0,<3.0.0
+
+# Database (Postgres: token vault, cache, locks, rate limiting, audit log)
+asyncpg>=0.29.0,<1.0.0
+
+# Token encryption at rest and per-tenant key derivation (HKDF)
+cryptography>=48.0.0,<49.0.0
+
+# Scheduling (HubSpot -> Airtable staging cycle)
+apscheduler>=3.10.0,<4.0.0
+
+# Airtable client
+pyairtable>=2.3.0,<3.0.0
+
+# Data Validation
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+
+# Observability
+structlog>=23.0.0,<24.0.0
+
+# Configuration
+python-dotenv>=1.0.0,<2.0.0
+pyyaml>=6.0.0,<7.0.0

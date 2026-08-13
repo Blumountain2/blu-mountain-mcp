@@ -1,0 +1,181 @@
+"""Tasks 4.5/4.6/8.3/SC-10: proves Airtable staging tags every record by
+client and never lets one tenant's pull write into another tenant's rows,
+using a fake Airtable API so no real base is touched."""
+
+import pytest
+
+from db import get_pool
+from sync import airtable_staging
+from sync.airtable_staging import normalize_record, stage_tenant_pull
+
+
+class _FakeTableSchema:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeBaseSchema:
+    def __init__(self, tables):
+        self.tables = tables
+
+
+class _FakeTable:
+    def __init__(self, store, name):
+        self._store = store
+        self._name = name
+
+    def batch_create(self, rows):
+        self._store.setdefault(self._name, []).extend(rows)
+
+
+class _FakeBase:
+    def __init__(self):
+        self.tables_created = []
+        self._existing = set()
+        self.written = {}
+
+    def schema(self):
+        return _FakeBaseSchema([_FakeTableSchema(n) for n in self._existing])
+
+    def create_table(self, name, fields):
+        self.tables_created.append(name)
+        self._existing.add(name)
+
+    def table(self, name):
+        return _FakeTable(self.written, name)
+
+
+class _FakeApi:
+    def __init__(self, base):
+        self._base = base
+
+    def base(self, base_id):
+        return self._base
+
+
+@pytest.fixture
+def fake_base(monkeypatch):
+    base = _FakeBase()
+    monkeypatch.setattr(airtable_staging, "_api", lambda: _FakeApi(base))
+    return base
+
+
+def test_normalize_record_tags_by_client():
+    row = normalize_record("hub_a", "list_contacts", {"id": "contact-1", "email": "a@x.com"})
+    assert row["Client"] == "hub_a"
+    assert row["Source ID"] == "contact-1"
+    assert "contact-1" in row["Data"]
+
+
+def test_ensure_schema_creates_only_missing_tables(fake_base):
+    fake_base._existing.add("Contacts")
+    airtable_staging.ensure_schema()
+
+    assert "Contacts" not in fake_base.tables_created
+    assert "Deals" in fake_base.tables_created
+    assert "SybillTranscripts" in fake_base.tables_created
+
+
+@pytest.mark.asyncio
+async def test_stage_tenant_pull_tags_every_row_with_correct_client(fake_base):
+    pulled = {
+        "list_contacts": [{"id": "contact-1"}, {"id": "contact-2"}],
+        "list_deals": {"id": "deal-1"},
+    }
+    await stage_tenant_pull("hub_a", pulled)
+
+    assert all(row["Client"] == "hub_a" for row in fake_base.written["Contacts"])
+    assert all(row["Client"] == "hub_a" for row in fake_base.written["Deals"])
+
+
+@pytest.mark.asyncio
+async def test_stage_tenant_pull_isolation_across_tenants(fake_base):
+    await stage_tenant_pull("hub_a", {"list_companies": {"id": "shared-looking-id"}})
+    await stage_tenant_pull("hub_b", {"list_companies": {"id": "shared-looking-id"}})
+
+    rows = fake_base.written["Companies"]
+    hub_a_rows = [r for r in rows if r["Client"] == "hub_a"]
+    hub_b_rows = [r for r in rows if r["Client"] == "hub_b"]
+
+    assert len(hub_a_rows) == 1
+    assert len(hub_b_rows) == 1
+    # Same underlying HubSpot-looking ID for two tenants never merges into
+    # one row or gets attributed to the wrong tenant.
+    assert hub_a_rows[0] is not hub_b_rows[0]
+
+
+@pytest.mark.asyncio
+async def test_stage_tenant_pull_skips_errored_results(fake_base):
+    await stage_tenant_pull("hub_a", {"list_contacts": {"error": "pull_failed"}})
+    assert "Contacts" not in fake_base.written
+
+
+@pytest.mark.asyncio
+async def test_stage_tenant_pull_stages_organization_landing_page_and_blog_post(fake_base):
+    # These three previously had no matching OBJECT_TABLES keyword and were
+    # pulled from HubSpot successfully, then silently dropped before ever
+    # reaching Airtable.
+    pulled = {
+        "get_organization_details": {"id": "team-1", "name": "Sales"},
+        "LANDING_PAGE": [{"id": "lp-1"}],
+        "BLOG_POST": [{"id": "bp-1"}],
+    }
+    await stage_tenant_pull("hub_a", pulled)
+
+    assert fake_base.written["Teams"][0]["Source ID"] == "team-1"
+    assert fake_base.written["LandingPages"][0]["Source ID"] == "lp-1"
+    assert fake_base.written["BlogPosts"][0]["Source ID"] == "bp-1"
+
+
+@pytest.mark.asyncio
+async def test_stage_tenant_pull_stages_campaign_data_list_as_one_row_per_campaign(fake_base):
+    # pull_campaign_data() returns a list of per-campaign records (each
+    # carrying its own "id"), the same shape as every other object type —
+    # not a dict keyed by campaign ID, which would collapse every
+    # campaign's metrics into a single malformed row. Staged into its own
+    # CampaignMetrics table, not "Campaigns" — pull_crm_objects()'s
+    # "CAMPAIGN" key (plain CRM records) and this "campaign_data" key
+    # (engagement metrics) are structurally different row shapes and must
+    # not collide under the same Source ID in the same table.
+    pulled = {
+        "campaign_data": [
+            {"id": "111", "analyticsResponse": {"views": 10}},
+            {"id": "222", "error": "pull_failed"},
+        ]
+    }
+    await stage_tenant_pull("hub_a", pulled)
+
+    rows = fake_base.written["CampaignMetrics"]
+    assert len(rows) == 1
+    assert rows[0]["Source ID"] == "111"
+
+
+@pytest.mark.asyncio
+async def test_campaign_crm_records_and_campaign_metrics_go_to_separate_tables(fake_base):
+    # pull_all() sets both "CAMPAIGN" (plain CRM properties, from
+    # pull_crm_objects) and "campaign_data" (engagement metrics, from
+    # pull_campaign_data) for a tenant with real campaigns — they must not
+    # land in the same table, since one row shape isn't the other's.
+    pulled = {
+        "CAMPAIGN": [{"id": "111", "properties": {"hs_name": "Spring Sale"}}],
+        "campaign_data": [{"id": "111", "analyticsResponse": {"views": 10}}],
+    }
+    await stage_tenant_pull("hub_a", pulled)
+
+    assert len(fake_base.written["Campaigns"]) == 1
+    assert len(fake_base.written["CampaignMetrics"]) == 1
+    assert fake_base.written["Campaigns"][0]["Source ID"] == "111"
+    assert fake_base.written["CampaignMetrics"][0]["Source ID"] == "111"
+
+
+@pytest.mark.asyncio
+async def test_hubspot_object_index_isolated_per_tenant_even_with_same_object_id(fake_base):
+    await stage_tenant_pull("hub_a", {"list_companies": {"id": "dup-id"}})
+    await stage_tenant_pull("hub_b", {"list_companies": {"id": "dup-id"}})
+
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT hub_id FROM hubspot_object_index WHERE object_type = 'company' AND object_id = 'dup-id'"
+    )
+    hub_ids = {row["hub_id"] for row in rows}
+    assert hub_ids == {"hub_a", "hub_b"}
