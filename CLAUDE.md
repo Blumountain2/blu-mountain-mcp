@@ -14,6 +14,8 @@ HubSpot OAuth, the token vault, the data pull, Airtable staging, Sybill ingestio
 
 The HubSpot side is now verified end-to-end against real external credentials, not just mocked ones: a real HubSpot Public App and a real HubSpot MCP Auth App (spec Section 4.1) are both registered, and both installs (`/install`, `/install/mcp-auth`) have completed for real against two test portals (see the Data pull section below), followed by real data pulls (`query_crm_data` against `mcp.hubspot.com`) that returned real records matching each portal's known state. The live session's FastMCP OAuth Proxy remains unverified end-to-end: it still needs a real Google Cloud OAuth client, which is not provisioned yet. Until that exists, no staff member can connect through the live session for real. Check the actual module contents before assuming something is or isn't implemented — this file is a summary, not the source of truth.
 
+`fastmcp`/`mcp` are pinned to `fastmcp==4.0.0b2`/`mcp==2.0.0` (`gateway/requirements.txt`), a deliberate beta pairing: FastMCP 4.0 is not GA yet (latest stable is 3.4.7), but it's the only FastMCP line that supports MCP SDK 2.0 (the 2026-07-28 stateless protocol revision) at all — FastMCP 3.4.7 hard-pins `mcp<2.0`. Verified compatible for every API surface this project actually calls (`Client`, `StreamableHttpTransport`, `FastMCP`, `GoogleProvider`, `get_access_token`, `CallToolResult.data`/`.content`/`.is_error`, `Tool.name`) via direct signature inspection plus a real, non-mocked in-process `Client`↔`FastMCP` smoke test, and the full test suite passes against it. **Not yet re-confirmed against the real `mcp.hubspot.com` endpoint or a real Google OAuth login** — this sandbox can't reach either — so treat the HubSpot pull and live session as needing one more live check against real credentials before trusting this pairing in production, the same standard every other "confirmed live" claim in this file already holds to.
+
 ## Non-negotiables
 
 These apply to every commit and every file in this repository.
@@ -84,9 +86,16 @@ cd gateway && pip install -r requirements.txt
 # Run the full test suite (rebuild first if source changed since the last image build)
 docker compose build mcp-gateway
 docker compose run --rm --user 0 mcp-gateway sh -c "pip install -q -r requirements-dev.txt && pytest -q"
+
+# MCP Inspector, for poking at the live session's /mcp endpoint directly (Node >=22.19 required)
+npm install
+npm run inspector          # web UI: connects to http://localhost:8888/mcp over Streamable HTTP
+npm run inspector:cli      # headless: lists tools via tools/list, no browser
 ```
 
 The test suite runs against its own `mcp_test` Postgres database, never the same `mcp` database `docker compose up`'s dev stack uses — `gateway/tests/conftest.py`'s `_pool` fixture truncates every table it touches after each test, and running it against `mcp` directly destroyed a real, verified tenant install twice in one session before this was fixed. `mcp_test` is created automatically on first run (via a maintenance connection to Postgres's own `postgres` database), nothing to set up by hand.
+
+**MCP Inspector** (`package.json` at repo root, dev-only Node tooling — no production code lives there): `@modelcontextprotocol/inspector@^2.2.0`, the version aligned with the 2026-07-28 MCP protocol revision `fastmcp`/`mcp` were upgraded to below. Requires Node >=22.19 (an older Node still runs it, just with an `EBADENGINE` warning). `npm run inspector` needs `docker compose up`'s stack already running, since it connects to the live session's real `/mcp` mount — completing its OAuth flow still needs the still-pending real Google Cloud OAuth client (see the live session's own gap noted above).
 
 ## Configuration
 

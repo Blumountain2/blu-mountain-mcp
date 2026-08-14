@@ -1,0 +1,15 @@
+{
+  "name": "blu-mountain-mcp-tooling",
+  "private": true,
+  "description": "Dev-only Node tooling for this project (MCP Inspector). No production code lives here — the service itself is the Python app under gateway/.",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "inspector": "mcp-inspector --web --transport http --server-url http://localhost:8888/mcp",
+    "inspector:cli": "mcp-inspector --cli --transport http --server-url http://localhost:8888/mcp --method tools/list"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "^2.2.0"
+  }
+}

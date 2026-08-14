@@ -81,6 +81,11 @@ temp/
 # dev/test runs, not part of source)
 .cache/
 
+# Node tooling (package.json at repo root: MCP Inspector only, dev-only —
+# see CLAUDE.md's Development commands). package-lock.json IS committed.
+node_modules/
+npm-debug.log*
+
 # Local notes
 context/Hubspot/
 
