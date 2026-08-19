@@ -382,3 +382,47 @@ async def query_hubspot_data(object_type: str) -> dict:
     await _audit(email, hub_id, "live_query", {"object_type": object_type})
     logger.info("live_session.query", staff=email, hub_id=hub_id, object_type=object_type)
     return result
+
+
+# Prompts return static instruction text only — they never touch the vault,
+# Postgres, or HubSpot themselves. All real data access still goes through
+# select_tenant/query_hubspot_data above, so nothing here needs its own
+# staff-identity or tenant-permission check; a prompt can't leak anything a
+# tool call wouldn't already guard. A first, deliberately small pair, not a
+# full library — real staff usage (none exists yet, since no client is
+# onboarded beyond Blu Mountain's own test portals) should drive what's
+# added next, not a guess at what might be wanted.
+#
+# Return type is a bare str, not list[Message]/list[dict] as this pinned
+# FastMCP version's own @mcp.prompt docstring example shows — confirmed
+# live that a dict message raises PromptError at render time on this
+# version ("messages[0] must be Message or str, got dict"); a bare string
+# is what actually works.
+
+
+@mcp.prompt
+def tenant_pipeline_overview(tenant: str) -> str:
+    """Summarizes one tenant's open sales pipeline: select the tenant, pull
+    its deals and companies, and report deal count, total value, and which
+    companies have the most active deals."""
+    return (
+        f"Select the tenant '{tenant}' (call select_tenant; if the result "
+        "is ambiguous, ask me which candidate is meant rather than "
+        "guessing). Then call query_hubspot_data for 'deals' and "
+        "'companies'. Summarize the open pipeline: how many deals are "
+        "open, their total value if the amount field is populated, and "
+        "which companies have the most active deals."
+    )
+
+
+@mcp.prompt
+def tenant_recent_activity(tenant: str) -> str:
+    """Summarizes one tenant's recent engagement: select the tenant, pull
+    its calls, emails, and meetings, and report a short activity digest."""
+    return (
+        f"Select the tenant '{tenant}' (call select_tenant; if the result "
+        "is ambiguous, ask me which candidate is meant rather than "
+        "guessing). Then call query_hubspot_data for 'calls', 'emails', "
+        "and 'meetings'. Summarize recent activity: roughly how much of "
+        "each kind happened, and anything notable worth flagging."
+    )

@@ -5,9 +5,11 @@ explicit, honest accounting of what's blocked or still open.
 Usage: python scripts/test_all.py
 (Run from anywhere; this script locates the repo root itself.)
 
-Exit code 0 means everything this script CAN test is passing. It cannot
-test what's blocked on real HubSpot/Google credentials, that's a real
-limit, not something this script hides.
+Exit code 0 means everything this script CAN test is passing. It never
+drives a real OAuth flow (HubSpot install/consent, Google Workspace
+login) itself — those are confirmed manually against real credentials,
+separately from this script — that's a real limit, not something this
+script hides.
 
 Python-only, standard library only (subprocess + urllib): start Postgres,
 build the real image, run the automated test suite against it, then hit
@@ -94,7 +96,7 @@ def main() -> int:
     section("3. Automated test suite (real Postgres, no live external credentials)")
     test_run = run([
         "docker", "compose", "run", "--rm", "--user", "0", "mcp-gateway", "sh", "-c",
-        "pip install -q -r requirements-dev.txt && pytest -q",
+        "pip install --no-cache-dir -q -r requirements-dev.txt && pytest -q",
     ])
     test_result = "PASSED" if test_run.returncode == 0 else "FAILED"
     if test_run.returncode != 0:
@@ -159,10 +161,10 @@ which only runs against test doubles/no external credentials):
   - Account-tier-gated features (Campaigns) confirmed working on the
     Enterprise-tier test portal, and confirmed to degrade gracefully
     (no crash) on the portal without that tier
-
-Blocked on manual action — this script CANNOT test this, no amount of
-code changes here substitutes for it:
-  - Registering the Google Cloud OAuth client for the live session\
+  - The live session's Google Cloud OAuth client is registered too, and a
+    real Google login has completed the full OAuth Proxy flow end to end
+    through MCP Inspector (not something this script itself exercises,
+    since its own smoke test above never drives an OAuth flow)\
 """)
 
     print()

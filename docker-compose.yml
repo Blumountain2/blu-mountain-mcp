@@ -56,10 +56,12 @@ services:
       FASTMCP_OAUTH_REDIRECT_URI: ${FASTMCP_OAUTH_REDIRECT_URI}
       FASTMCP_ALLOWED_GOOGLE_DOMAINS: ${FASTMCP_ALLOWED_GOOGLE_DOMAINS}
       FASTMCP_ACCESS_TOKEN_TTL_MINUTES: ${FASTMCP_ACCESS_TOKEN_TTL_MINUTES:-30}
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
-      GOOGLE_HOSTED_DOMAIN: ${GOOGLE_HOSTED_DOMAIN}
-      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID}
-      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID}
+      # GOOGLE_CLIENT_ID/GOOGLE_HOSTED_DOMAIN/MICROSOFT_CLIENT_ID/
+      # MICROSOFT_TENANT_ID deliberately not passed through — they're
+      # session/staff_auth.py's own vars (read via os.getenv, not
+      # config.settings), and staff_auth.py is unhooked from main.py, so
+      # nothing running today reads them. Add them back here (and to
+      # .env.example) if that module is ever wired back in.
       DATABASE_URL: ${DATABASE_URL}
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}

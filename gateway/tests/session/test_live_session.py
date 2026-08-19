@@ -575,3 +575,38 @@ async def test_real_transport_query_hubspot_data_round_trip(monkeypatch):
         result = await client.call_tool("query_hubspot_data", {"object_type": "owners"})
 
     assert result.data == {"search_owners": {"owners": []}}
+
+
+@pytest.mark.asyncio
+async def test_real_transport_lists_both_prompts_with_correct_schemas():
+    async with Client(live_session.mcp) as client:
+        prompts = await client.list_prompts()
+
+    by_name = {p.name: {a.name for a in (p.arguments or [])} for p in prompts}
+    assert by_name == {
+        "tenant_pipeline_overview": {"tenant"},
+        "tenant_recent_activity": {"tenant"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_transport_tenant_pipeline_overview_prompt_round_trip():
+    async with Client(live_session.mcp) as client:
+        result = await client.get_prompt("tenant_pipeline_overview", {"tenant": "Acme"})
+
+    assert len(result.messages) == 1
+    text = result.messages[0].content.text
+    assert "Acme" in text
+    assert "select_tenant" in text
+    assert "query_hubspot_data" in text
+
+
+@pytest.mark.asyncio
+async def test_real_transport_tenant_recent_activity_prompt_round_trip():
+    async with Client(live_session.mcp) as client:
+        result = await client.get_prompt("tenant_recent_activity", {"tenant": "Acme"})
+
+    assert len(result.messages) == 1
+    text = result.messages[0].content.text
+    assert "Acme" in text
+    assert "calls" in text and "emails" in text and "meetings" in text

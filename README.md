@@ -4,7 +4,7 @@ A multi-tenant data sync service for Blu Mountain's Intelligence System. It auth
 
 ## Status
 
-HubSpot OAuth, the token vault, the data pull, Airtable staging, Sybill ingestion, and the live session are all built and unit-tested — 179 tests passing against a real Postgres instance, re-run automatically on every push/PR to `dev`/`main` (`.github/workflows/ci.yml`). Real HubSpot Public App and MCP Auth App credentials are registered and both installs have been completed end to end against real test portals. The live session's Google Cloud OAuth client is registered too, and a real Google login has completed the full OAuth Proxy flow end to end through MCP Inspector. Ask a teammate for the current phase plan and project background if you need it.
+HubSpot OAuth, the token vault, the data pull, Airtable staging, Sybill ingestion, and the live session are all built and unit-tested — 182 tests passing against a real Postgres instance, re-run automatically on every push/PR to `dev`/`main` (`.github/workflows/ci.yml`). Real HubSpot Public App and MCP Auth App credentials are registered and both installs have been completed end to end against real test portals. The live session's Google Cloud OAuth client is registered too, and a real Google login has completed the full OAuth Proxy flow end to end through MCP Inspector. Ask a teammate for the current phase plan and project background if you need it.
 
 ## What this is
 
