@@ -67,15 +67,25 @@ def test_missing_signature_rejected():
 async def test_resolve_hub_id_unique_match():
     pool = await get_pool()
     await pool.execute(
+        "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('deal', 'deal-1', 'hub_a')"
+    )
+    payload = {"data": {"crm": {"id": "deal-1", "name": "Some Deal", "type": "opportunity"}}}
+    assert await resolve_hub_id(payload) == "hub_a"
+
+
+@pytest.mark.asyncio
+async def test_resolve_hub_id_company_type_match():
+    pool = await get_pool()
+    await pool.execute(
         "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('company', 'acc-1', 'hub_a')"
     )
-    payload = {"data": {"crmInfo": {"accountId": "acc-1"}}}
+    payload = {"data": {"crm": {"id": "acc-1", "name": "Some Account", "type": "account"}}}
     assert await resolve_hub_id(payload) == "hub_a"
 
 
 @pytest.mark.asyncio
 async def test_resolve_hub_id_no_match_raises():
-    payload = {"data": {"crmInfo": {"accountId": "unknown-id"}}}
+    payload = {"data": {"crm": {"id": "unknown-id", "name": "Unknown", "type": "opportunity"}}}
     with pytest.raises(SybillTenantResolutionError):
         await resolve_hub_id(payload)
 
@@ -84,11 +94,25 @@ async def test_resolve_hub_id_no_match_raises():
 async def test_resolve_hub_id_ambiguous_match_raises():
     pool = await get_pool()
     await pool.execute(
-        "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('company', 'acc-shared', 'hub_a')"
+        "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('deal', 'deal-shared', 'hub_a')"
     )
     await pool.execute(
-        "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('company', 'acc-shared', 'hub_b')"
+        "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('deal', 'deal-shared', 'hub_b')"
     )
-    payload = {"data": {"crmInfo": {"accountId": "acc-shared"}}}
+    payload = {"data": {"crm": {"id": "deal-shared", "name": "Shared Deal", "type": "opportunity"}}}
+    with pytest.raises(SybillTenantResolutionError):
+        await resolve_hub_id(payload)
+
+
+@pytest.mark.asyncio
+async def test_resolve_hub_id_missing_crm_raises():
+    payload = {"data": {}}
+    with pytest.raises(SybillTenantResolutionError):
+        await resolve_hub_id(payload)
+
+
+@pytest.mark.asyncio
+async def test_resolve_hub_id_unrecognized_crm_type_raises():
+    payload = {"data": {"crm": {"id": "deal-1", "name": "Some Deal", "type": "lead"}}}
     with pytest.raises(SybillTenantResolutionError):
         await resolve_hub_id(payload)

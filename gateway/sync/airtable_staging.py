@@ -103,8 +103,24 @@ def ensure_schema() -> None:
 
 
 def normalize_record(hub_id: str, object_type: str, raw: dict) -> dict:
-    """Normalizes one HubSpot object into a staging row, tagged by client."""
-    source_id = str(raw.get("id", "")) if isinstance(raw, dict) else ""
+    """Normalizes one HubSpot object into a staging row, tagged by client.
+
+    ID extraction prefers raw["properties"]["hs_object_id"] over a
+    top-level "id" key. Confirmed live: query_crm_data's CRM object records
+    (COMPANY, DEAL — the path sync.hubspot_client.pull_crm_objects always
+    selects hs_object_id for) have no top-level "id" field at all, and "id"
+    isn't even a valid property name for any CRM object type; hs_object_id
+    is the real one. The generic per-object tools (e.g.
+    get_organization_details) and campaign_data's per-campaign records use
+    a top-level "id" instead — confirmed separately, during this
+    project's earlier live testing — so that's kept as the fallback rather
+    than replaced, to avoid silently breaking an already-verified path on
+    an assumption from a different tool family."""
+    source_id = ""
+    if isinstance(raw, dict):
+        properties = raw.get("properties")
+        hs_object_id = properties.get("hs_object_id") if isinstance(properties, dict) else None
+        source_id = str(hs_object_id) if hs_object_id else str(raw.get("id", "") or "")
     return {
         "Client": hub_id,
         "Source ID": source_id,
@@ -116,15 +132,12 @@ def normalize_record(hub_id: str, object_type: str, raw: dict) -> dict:
 
 def normalize_sybill_transcript(hub_id: str, payload: dict) -> dict:
     """Normalizes an accepted Sybill webhook payload for staging (FR-12)."""
-    data = payload.get("data", {})
-    metadata = data.get("metadata", {})
     return {
         "Client": hub_id,
         "Source ID": str(payload.get("objectId", "")),
         "Object Type": payload.get("eventType", "sybill.meeting"),
         "Data": json.dumps(payload, default=str),
         "Synced At": datetime.now(timezone.utc).isoformat(),
-        "_meeting_title": metadata.get("title"),
     }
 
 
@@ -160,7 +173,8 @@ async def stage_tenant_pull(hub_id: str, pulled: dict[str, object]) -> None:
 
 async def _index_crm_objects(hub_id: str, by_table: dict[str, list[dict]]) -> None:
     """Indexes Company/Deal IDs so webhooks.sybill can resolve which tenant a
-    transcript's crmInfo belongs to. See schema.sql's hubspot_object_index."""
+    transcript's data.crm reference belongs to. See schema.sql's
+    hubspot_object_index."""
     indexable = {"Companies": "company", "Deals": "deal"}
     pool = await get_pool()
     for table_name, object_type in indexable.items():

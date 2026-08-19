@@ -5,10 +5,22 @@
 CREATE TABLE IF NOT EXISTS tenants (
     hub_id TEXT PRIMARY KEY,
     portal_name TEXT,
+    hub_domain TEXT,
     install_status TEXT NOT NULL DEFAULT 'installed',
     installed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- hub_domain didn't exist when this table was first created — this file has
+-- no separate migration tool, so an idempotent ALTER right after the CREATE
+-- is how an already-provisioned database (real vaulted tenant tokens, not
+-- droppable) picks up a new column; a fresh database just gets it as a
+-- no-op. portal_name is the human-curated name (set only via /install's
+-- optional query param, never auto-overwritten); hub_domain is HubSpot's own
+-- domain for the portal, auto-captured from the OAuth access-token-info
+-- response on every install/reinstall. Readers should use
+-- COALESCE(portal_name, hub_domain, hub_id), never hub_domain alone.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS hub_domain TEXT;
 
 CREATE TABLE IF NOT EXISTS tokens (
     hub_id TEXT PRIMARY KEY REFERENCES tenants(hub_id) ON DELETE CASCADE,
@@ -35,8 +47,14 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 CREATE TABLE IF NOT EXISTS oauth_states (
     state TEXT PRIMARY KEY,
     code_verifier TEXT NOT NULL,
+    portal_name TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- portal_name carries /install's optional ?portal_name= query param across
+-- the redirect round-trip to /callback, the same way code_verifier already
+-- does — see the ALTER note on tenants above for why this ALTER exists too.
+ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS portal_name TEXT;
 
 -- Per-tenant token-bucket rate limiting (SC-7).
 CREATE TABLE IF NOT EXISTS rate_limit_buckets (

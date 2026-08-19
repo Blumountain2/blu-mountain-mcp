@@ -390,7 +390,7 @@ async def test_pull_crm_objects_queries_every_confirmed_object_type(monkeypatch)
 
     assert set(result.keys()) == set(hubspot_client.CRM_OBJECT_TYPES)
     for object_type in hubspot_client.CRM_OBJECT_TYPES:
-        assert f"SELECT * FROM {object_type}" in seen_sql
+        assert f"SELECT hs_object_id, * FROM {object_type}" in seen_sql
 
 
 def test_crm_object_types_covers_segments_landing_pages_and_blog_posts():

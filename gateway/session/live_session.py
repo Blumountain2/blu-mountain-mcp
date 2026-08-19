@@ -92,10 +92,29 @@ async def _require_staff_identity() -> tuple[str, str]:
     FASTMCP_ALLOWED_GOOGLE_DOMAINS was harmless, since a stranger still had
     no grant row; under default-open, this domain check is the *only* gate,
     so the safe default when it's misconfigured is to admit no one, not
-    everyone."""
+    everyone.
+
+    `hd` (the Workspace hosted-domain claim) is NOT a top-level field on the
+    token FastMCP's GoogleProvider issues — confirmed live by reading its
+    source: the AccessToken.claims dict it builds only has sub/aud/email/
+    name/picture/given_name/family_name/locale/google_user_data, no hd. The
+    real value lives inside google_user_data, the raw Google v2 userinfo
+    response nested wholesale under that one key. A real login always
+    passed `hd` correctly through Google's own consent screen and callback
+    (visible in main.py's callback logs), but every domain check here still
+    read as empty — discovered only by actually calling a tool with a real
+    issued token, since every unit test for this function constructs its
+    own fake token with `hd` placed at the top level, matching the wrong
+    (pre-fix) assumption instead of the real shape."""
     token = get_access_token()
     email = (token.claims.get("email") or "").lower()
-    domain = (token.claims.get("hd") or "").lower()
+    google_user_data = token.claims.get("google_user_data")
+    if not isinstance(google_user_data, dict):
+        # Fails closed the same way a missing key does (see this
+        # function's docstring) rather than crashing, in case a future
+        # token ever carries a non-dict truthy value here.
+        google_user_data = {}
+    domain = (token.claims.get("hd") or google_user_data.get("hd") or "").lower()
     allowed = settings.allowed_google_domains_list
 
     if not allowed or domain not in allowed:
@@ -109,7 +128,7 @@ async def _require_staff_identity() -> tuple[str, str]:
     return email, session_key
 
 
-async def _permitted_tenants(staff_identity: str) -> list[str]:
+async def _permitted_tenants(staff_identity: str) -> list[dict]:
     """Every installed tenant, minus any explicitly restricted for this staff
     member, in a single query — not the shared get_installed_hub_ids() (used
     by the once-per-cycle scheduled sync) plus a second restrictions query,
@@ -121,11 +140,28 @@ async def _permitted_tenants(staff_identity: str) -> list[str]:
     already lowercased by the caller (_require_staff_identity); LOWER() on
     the stored column is the other half of that guarantee — a restriction
     row hand-typed with different casing must still match, not silently
-    fail open just because the comparison itself was case-sensitive."""
+    fail open just because the comparison itself was case-sensitive.
+
+    Returns each tenant's effective display name alongside its hub_id —
+    COALESCE(portal_name, hub_domain, hub_id) computed here in SQL so every
+    caller sees a real, never-NULL name without re-deriving the same
+    fallback chain in Python. Each candidate is wrapped in NULLIF(TRIM(...), '')
+    first: an empty or whitespace-only string is not NULL to Postgres, so a
+    bare COALESCE would treat a blank portal_name as "the real name" instead
+    of falling through to hub_domain — the write path normalizes blanks to
+    NULL too (see hubspot_oauth.py's /install and _persist_new_tenant), but
+    this guards the read path independently rather than trusting every
+    possible writer got it right. portal_name is a human-curated name (set
+    only via /install's optional query param); hub_domain is HubSpot's own
+    domain for the portal, auto-captured at install time (HubSpot has no
+    API for an actual company/display name — confirmed against its
+    account-info endpoint)."""
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT hub_id FROM tenants
+        SELECT hub_id,
+               COALESCE(NULLIF(TRIM(portal_name), ''), NULLIF(TRIM(hub_domain), ''), hub_id) AS name
+        FROM tenants
         WHERE install_status = 'installed'
           AND hub_id NOT IN (
               SELECT hub_id FROM staff_tenant_restrictions WHERE LOWER(staff_identity) = $1
@@ -133,7 +169,11 @@ async def _permitted_tenants(staff_identity: str) -> list[str]:
         """,
         staff_identity,
     )
-    return [row["hub_id"] for row in rows]
+    return [{"hub_id": row["hub_id"], "name": row["name"]} for row in rows]
+
+
+def _hub_ids(permitted: list[dict]) -> set[str]:
+    return {t["hub_id"] for t in permitted}
 
 
 async def _deny_tenant_access(staff_identity: str, hub_id: str, reason: str) -> None:
@@ -194,13 +234,14 @@ async def _resolve_selected_tenant(staff_identity: str, session_key: str) -> str
 
     if row and row["selected_hub_id"]:
         selected_hub_id = row["selected_hub_id"]
-        if selected_hub_id not in permitted:
+        if selected_hub_id not in _hub_ids(permitted):
             await _deny_tenant_access(staff_identity, selected_hub_id, "restricted_mid_session")
         return selected_hub_id
 
     if len(permitted) == 1:
-        await _persist_tenant_selection(staff_identity, session_key, permitted[0])
-        return permitted[0]
+        only_hub_id = permitted[0]["hub_id"]
+        await _persist_tenant_selection(staff_identity, session_key, only_hub_id)
+        return only_hub_id
 
     raise TenantSelectionRequired(
         "More than one tenant is permitted; call select_tenant first"
@@ -209,7 +250,7 @@ async def _resolve_selected_tenant(staff_identity: str, session_key: str) -> str
 
 async def select_tenant_internal(staff_identity: str, session_key: str, hub_id: str) -> None:
     permitted = await _permitted_tenants(staff_identity)
-    if hub_id not in permitted:
+    if hub_id not in _hub_ids(permitted):
         await _deny_tenant_access(staff_identity, hub_id, "explicit_selection_not_permitted")
 
     await _persist_tenant_selection(staff_identity, session_key, hub_id)
@@ -220,8 +261,11 @@ async def _audit(staff_identity: str, hub_id: str, event_type: str, detail: dict
 
 
 @mcp.tool
-async def list_my_tenants() -> list[str]:
-    """Lists the client tenants this staff member is permitted to query."""
+async def list_my_tenants() -> list[dict]:
+    """Lists the client tenants this staff member is permitted to query, each
+    as {"hub_id": ..., "name": ...}. name is never blank — it falls back
+    from a human-curated name to HubSpot's own portal domain to the bare
+    hub_id, in that order (see _permitted_tenants)."""
     email, _session_key = await _require_staff_identity()
     tenants = await _permitted_tenants(email)
     await _audit(email, None, "live_tenants_listed", {"tenant_count": len(tenants)})
@@ -229,13 +273,47 @@ async def list_my_tenants() -> list[str]:
 
 
 @mcp.tool
-async def select_tenant(hub_id: str) -> dict:
-    """Selects one tenant for this session. Required when more than one
-    tenant is permitted; not needed if only one tenant is permitted."""
+async def select_tenant(tenant: str) -> dict:
+    """Selects one tenant for this session, by hub_id OR by name (exact
+    hub_id match is tried first and always wins — it's unambiguous by
+    construction). A name is matched case-insensitively as a substring
+    against each permitted tenant's display name. Required when more than
+    one tenant is permitted; not needed if only one tenant is permitted.
+
+    If the name matches more than one permitted tenant, this does NOT
+    guess: it returns {"ambiguous": True, "candidates": [...]} instead of
+    selecting anything, since a wrong guess here is a real cross-tenant
+    risk under this project's default-open access model. Call this again
+    with one candidate's exact hub_id or full name once you know which one
+    is meant."""
     email, session_key = await _require_staff_identity()
-    await select_tenant_internal(email, session_key, hub_id)
-    await _audit(email, hub_id, "live_tenant_selected", {})
-    return {"selected_hub_id": hub_id}
+    permitted = await _permitted_tenants(email)
+
+    exact_hub = next((t for t in permitted if t["hub_id"] == tenant), None)
+    if exact_hub is not None:
+        await select_tenant_internal(email, session_key, exact_hub["hub_id"])
+        await _audit(email, exact_hub["hub_id"], "live_tenant_selected", {})
+        return {"selected_hub_id": exact_hub["hub_id"], "name": exact_hub["name"]}
+
+    needle = tenant.strip().lower()
+    name_matches = [t for t in permitted if needle in t["name"].lower()]
+
+    if len(name_matches) == 1:
+        match = name_matches[0]
+        await select_tenant_internal(email, session_key, match["hub_id"])
+        await _audit(email, match["hub_id"], "live_tenant_selected", {})
+        return {"selected_hub_id": match["hub_id"], "name": match["name"]}
+
+    if len(name_matches) > 1:
+        logger.warning("live_session.tenant_selection_ambiguous", staff=email, query=tenant)
+        await _audit(email, None, "live_tenant_selection_ambiguous", {"query": tenant})
+        return {
+            "ambiguous": True,
+            "query": tenant,
+            "candidates": [{"hub_id": t["hub_id"], "name": t["name"]} for t in name_matches],
+        }
+
+    await _deny_tenant_access(email, tenant, "no_match")
 
 
 @mcp.tool

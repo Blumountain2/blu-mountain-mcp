@@ -6,7 +6,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "inspector": "mcp-inspector --web --transport http --server-url http://localhost:8888/mcp",
+    "inspector": "mcp-inspector --web",
     "inspector:cli": "mcp-inspector --cli --transport http --server-url http://localhost:8888/mcp --method tools/list"
   },
   "devDependencies": {

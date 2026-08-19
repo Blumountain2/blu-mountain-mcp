@@ -6,96 +6,56 @@ be worked on in the meantime. Kept separate from `context/Hubspot/IMPLEMENTATION
 happened; this one is meant to be replaced wholesale each time the blocker
 picture changes, not appended to.
 
-Last confirmed accurate: 2026-08-13, after a real, live, end-to-end HubSpot
-install and full data pull against two test portals — see
+Last confirmed accurate: 2026-08-17, after real, live, end-to-end
+confirmation of the live session's Google OAuth Proxy (a real Google login
+through MCP Inspector, full DCR/authorize/consent/token-exchange flow,
+re-confirmed again via a real `/install`/`/install/mcp-auth` reinstall),
+the Airtable staging pipeline (a real base created, schema provisioned via
+`ensure_schema()`, and a real pull-and-stage cycle run against both test
+portals), and the live session's three tools themselves (`list_my_tenants`,
+`select_tenant`, `query_hubspot_data`) — exercised for real through MCP
+Inspector and covered by automated real-`Client`↔`FastMCP`-transport tests,
+not just connected — see
 `openspec/changes/implement-hubspot-mcp-server/design.md`'s decision log for
-the full history of what that confirmed, including every previously-open
-gap in the HubSpot pull itself now being resolved.
+the full history.
 
 ## Blocked (needs an external action, not resolvable by writing more code)
 
-### 1. Google Cloud OAuth client for the live session — blocked, manual
-
-**What's blocked:** Real end-to-end testing of the live MCP session (FastMCP's
-OAuth Proxy wrapping Google Workspace) — a Blu Mountain staff member actually
-connecting from Claude Desktop/Code/Cowork, signing in, and getting a live
-HubSpot response back.
-
-**Why:** `FASTMCP_GOOGLE_CLIENT_ID`/`FASTMCP_GOOGLE_CLIENT_SECRET` need a real
-Web application OAuth 2.0 client registered in a Google Cloud project (Google
-does not support automatic client registration). Nobody has provisioned this
-yet.
-
-**What's NOT blocked by this:** everything else about the live session is
-built and unit-tested (domain allowlisting, default-open tenant access with
-explicit restrictions, tenant-selection enforcement, per-access audit
-logging, the two discovery-metadata redirect fixes) — see tasks.md Section 6,
-items 6.2-6.11, all `[x]`. Only 6.1 (the credential itself) and the live
-connect it enables remain open.
-
-**Who unblocks it:** whoever has (or can get) admin access to a Google Cloud
-project for Blu Mountain.
-
-**Request to send:** *"We need a Google Cloud OAuth 2.0 'Web application'
-client so Blu Mountain staff can sign into the live HubSpot MCP session with
-Google Workspace. To set this up: in a Google Cloud project, create an OAuth
-2.0 Client ID (type: Web application), set its redirect URI to
-`http://localhost:8888/mcp/auth/callback` (we'll update this once hosting
-exists), and send us the resulting Client ID and Client Secret."*
-
-### 2. Airtable staging base — confirmed it needs creating, not just confirming
-
-**What's blocked:** Re-running task 4.6's real end-to-end staging test (pull
-real HubSpot CRM data → normalize → write into a real Airtable base, tagged
-by client) — currently only proven against a fake Airtable API.
-
-**Why:** Checked directly via Airtable's own metadata API
-(`GET /v0/meta/bases`) — the current `AIRTABLE_API_KEY` PAT can see exactly
-one base, "Engagement tracker" (`appuhahB1CTVY0nyF`), and it is **not** a
-staging base: it's an existing, actively-used business base (one table per
-real client, meeting/task/QA tracking), unrelated to this project's
-per-HubSpot-object-type staging schema. Writing this sync job's tables into
-it risks colliding with real business data already there. No staging base
-exists yet, and this PAT has no visibility into any other base or workspace
-to create one from.
-
-**What's NOT blocked by this:** the staging code itself — schema design,
-per-object-type normalization, the scheduled job, client tagging, and
-cross-tenant isolation — is fully built and unit-tested (tasks.md Section 4,
-items 4.1-4.5, all `[x]`).
-
-**Who unblocks it:** whoever manages the `internalops@blumountain.me`
-Airtable account.
-
-**Request to send:** *"We need a new, empty Airtable base to stage HubSpot
-and Sybill data into — separate from the existing 'Engagement tracker' base,
-which is already in use for something else. To set this up: create a new
-base in Airtable, share it with the `internalops@blumountain.me` service
-account at Creator access, and send us that base's ID (starts with `app...`
-— found in the base's URL or its API documentation page)."*
-
-### 3. Real Sybill traffic — needed to validate one open edge case
+### 1. Real Sybill traffic — needed to validate one open edge case
 
 **What's blocked:** Confirming task 5.6's flagged open item: whether an
-ambiguous or unmatched `crmInfo.accountId`/`opportunityId` in a real Sybill
-payload behaves as expected (rejected, not guessed at) under real traffic
-rather than constructed test fixtures.
+ambiguous or unmatched `data.crm` reference in a real Sybill payload behaves
+as expected (rejected, not guessed at) under real traffic rather than
+constructed test fixtures. Also unconfirmed: the exact `crm.type` string
+Sybill sends for a company/account-linked event — only `"opportunity"`
+(deal-equivalent) has been confirmed live so far; `"account"` is inferred
+from the same naming convention, not yet seen in a real payload.
 
 **Why:** This needs an actual Sybill webhook delivery hitting the receiver,
 which needs Sybill actually configured to send them for a real client
 account.
 
-**What's NOT blocked by this:** signature validation, normalization, and
-staging are all built and unit-tested against Sybill's own published schema
-(tasks.md Section 5, items 5.1-5.6, all `[x]`). This is a real-traffic
-validation step, not missing functionality.
+**What's NOT blocked by this:** everything else about Sybill ingestion.
+Whether webhook or polling was the real delivery mechanism (spec open item
+#6) is resolved — webhook, decided 2026-08-15 on the credential actually
+provisioned (a live-mode `SYBILL_WEBHOOK` signing secret; no polling
+credential of any kind exists — a vendor doesn't hand out a webhook secret
+for an integration that isn't using webhooks). Signature validation,
+normalization, and staging are all built and tested (tasks.md Section 5,
+items 5.1-5.6, all `[x]`) — **note:** tenant resolution had a critical
+schema bug (`data.crmInfo.accountId`/`opportunityId`, which never appears in
+Sybill's real payload) that would have caused every real event to be
+rejected; found and fixed 2026-08-17 against a real payload obtained from
+the user's own Sybill trial account, see design.md's decision log. This
+blocker is now a real-traffic validation step for the corrected code, not
+missing functionality or an unresolved design question.
 
 **Who unblocks it:** whoever manages the Sybill integration on Blu Mountain's
 side, once at least one client has both Sybill and this system live. No
 request to send yet — nothing to ask for until a real client is live on
 both.
 
-### 4. Production hosting, subdomain, managed Postgres, secrets platform
+### 2. Production hosting, subdomain, managed Postgres, secrets platform
 
 **What's blocked:** Deploying anywhere other than a local machine.
 
@@ -105,8 +65,8 @@ Section 4.5). Production OAuth redirect URIs for both HubSpot and Google
 can't be registered until the subdomain exists.
 
 **What's NOT blocked by this:** all local development, testing, and the real
-credentialed HubSpot testing already done. This only matters once onboarding
-a real (non-test) client portal becomes the goal.
+credentialed HubSpot/Google/Airtable testing already done. This only matters
+once onboarding a real (non-test) client portal becomes the goal.
 
 **Who unblocks it:** whoever can create/delegate the hosting account.
 
@@ -119,27 +79,61 @@ us know if a different host is preferred."*
 
 ## Resolved since the last version of this file
 
-Everything about the HubSpot pull itself that was previously open or
-tracked as lower-priority is now done and confirmed live:
-
-- The 4 marketing/analytics tools that originally failed
-  (`get_campaign_attribution_reports`, `get_content_analytics_report`,
-  `get_marketing_email_analytics`, `read_campaign_data`) are all fixed and
-  confirmed working. Two were genuine missing-parameter bugs; the other two
-  needed a second, Enterprise-tier developer test account (`hub_id=149094230`,
-  free — HubSpot's test accounts include a 90-day enterprise trial by
-  default and can't be upgraded, so a fresh account was the fix, not an
-  upgrade) with a real campaign created in it to verify.
-- A full audit of every real discovered tool (not just the ones already
-  failing) found and fixed a real observability gap, and through it, real
-  coverage for the spec's "teams," "segments," "landing pages," and "blog
-  posts" reference objects.
-- See `openspec/changes/implement-hubspot-mcp-server/design.md`'s decision
-  log for the full detail on all of the above.
+- **Sybill tenant resolution's payload schema was wrong** — `resolve_hub_id()`
+  read `data.crmInfo.accountId`/`opportunityId`, a field that never appears
+  in Sybill's real payload; every real event would have been rejected.
+  Found via a real "Test"-button payload from the user's own Sybill trial
+  account, fixed to read the real `data.crm.id`/`data.crm.type` shape, and
+  the three affected unit tests rewritten to match. See design.md's
+  decision log for the full account.
+- **`hubspot_object_index` had been empty for every tenant, always** —
+  found while seeding real test data to actually exercise the fix above.
+  `pull_crm_objects()`'s `SELECT * FROM {TYPE}` never returns a CRM
+  object's own ID (confirmed live: HubSpot's default property set
+  excludes it, and `id` isn't a valid property name — `hs_object_id` is,
+  nested inside `properties`). Every CRM object staged since this was
+  first built had a blank Source ID, so nothing was ever indexed — meaning
+  Sybill's tenant resolution could never have succeeded, on either test
+  portal, even after the fix directly above. Fixed by selecting
+  `hs_object_id` explicitly and reading it from the right place; confirmed
+  live by re-running the pull against both real test portals and seeing
+  real rows land in `hubspot_object_index` for the first time. See
+  design.md's decision log.
+- **Google Cloud OAuth client for the live session** — previously blocked on
+  a manual credential registration. Now resolved: `FASTMCP_GOOGLE_CLIENT_ID`/
+  `FASTMCP_GOOGLE_CLIENT_SECRET` are real, and the full live-session OAuth
+  Proxy flow was confirmed end to end for the first time — Dynamic Client
+  Registration, `/authorize`, a real Google consent screen (Workspace domain
+  `blumountain.me`), `/auth/callback`, token exchange, and a real
+  authenticated MCP session (`POST /mcp/` returning `200`/`202`) — via MCP
+  Inspector, not mocked.
+- **Airtable staging base** — previously blocked: the only base the service
+  account's PAT could see was "Engagement tracker," an existing business
+  base unrelated to this project. Now resolved: a real, separate staging
+  base was created, `ensure_schema()` provisioned all 21 tables in it for
+  real, and a manually-triggered `run_staging_cycle()` staged both real test
+  portals correctly — including the Enterprise-tier portal's
+  `Campaigns`/`CampaignMetrics` tables and the baseline portal's graceful
+  degradation on HubSpot's own account-tier gate for `CAMPAIGN`.
+- **Sybill's delivery mechanism (webhook vs. polling)** — previously an open
+  design question pending client clarification. Now decided: webhook, per
+  the credential evidence described in blocker #1 above, not a client
+  re-confirmation.
+- **The live session's three tools** (`list_my_tenants`, `select_tenant`,
+  `query_hubspot_data`) — previously only connecting had been confirmed, not
+  actually calling them. Now resolved: exercised for real through MCP
+  Inspector (including `select_tenant`'s ambiguous-name-candidates path),
+  and separately covered by automated tests using a real `Client`↔`FastMCP`
+  in-memory transport (`gateway/tests/session/test_live_session.py`'s
+  `test_real_transport_*` tests) — not just direct Python calls with
+  monkeypatched auth.
+- Everything about the HubSpot pull itself that was previously open or
+  tracked as lower-priority was already resolved as of the prior version of
+  this file (the 4 marketing/analytics tool bugs, and the "teams"/"segments"/
+  "landing pages"/"blog posts" observability gap) — see design.md's decision
+  log.
 
 ## Available now — real work, not blocked by any of the above
 
-Nothing outstanding as of this version. Everything currently buildable
-without external input has been built; what remains is either genuinely
-blocked (above) or not yet identified. Re-check this section next time the
-blocker picture changes.
+Nothing currently buildable without external input remains outstanding.
+Re-check this section next time the blocker picture changes.

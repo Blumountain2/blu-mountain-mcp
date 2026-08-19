@@ -7,12 +7,24 @@ directly against Svix's documented scheme rather than the `svix` SDK, to
 avoid adding an unverified new dependency; the algorithm itself is public
 and stable (svix-id, svix-timestamp, svix-signature headers, HMAC-SHA256).
 
-Open item, flagged not guessed: Sybill's payload carries no hub_id of its
-own. Tenant is resolved via crmInfo.accountId/opportunityId against the
-hubspot_object_index (populated by sync.airtable_staging as Companies/Deals are
-staged). If that lookup is ambiguous or empty, the payload is rejected
+Tenant resolution: Sybill's payload carries no hub_id of its own. Tenant is
+resolved via data.crm (a single {id, name, type} object) against the
+hubspot_object_index (populated by sync.airtable_staging as Companies/Deals
+are staged). If that lookup is ambiguous or empty, the payload is rejected
 rather than guessed at, since a wrong guess here would be a cross-tenant
-leak. This needs validating against real traffic before go-live.
+leak.
+
+Confirmed live 2026-08-17 via a real "Test" payload from a real Sybill
+trial account (event meeting.new_recording.v2) — this replaced an earlier,
+wrong assumption (data.crmInfo.accountId/opportunityId, two separate
+fields) that Sybill's own docs page seemed to describe at the time this
+was first built, but which does not match what the real, current API
+actually sends: one combined data.crm.id/data.crm.type object, using
+Salesforce-flavored terminology ("opportunity") rather than HubSpot's own
+("deal"). Both spellings are accepted below since Sybill supports both
+CRMs against what looks like one shared schema; only "opportunity" is
+confirmed live so far — "account" is inferred from the same convention,
+not yet confirmed against a real company-linked event.
 """
 
 import base64
@@ -75,25 +87,40 @@ def verify_svix_signature(
     return False
 
 
+# Sybill's crm.type uses Salesforce-flavored terminology ("opportunity"),
+# confirmed live; "account" is the same convention's presumed company-side
+# counterpart, not yet confirmed against a real payload. HubSpot's own
+# terminology ("deal"/"company") is accepted too in case a future event
+# ever uses it directly, since accepting an extra, never-seen spelling
+# costs nothing and only widens what resolves correctly.
+_CRM_TYPE_TO_OBJECT_TYPE = {
+    "opportunity": "deal",
+    "deal": "deal",
+    "account": "company",
+    "company": "company",
+}
+
+
 async def resolve_hub_id(payload: dict) -> str:
-    """Resolves the owning tenant from crmInfo, or raises if ambiguous/unknown."""
-    crm_info = payload.get("data", {}).get("crmInfo", {}) or {}
-    candidate_ids = [
-        ("company", crm_info.get("accountId")),
-        ("deal", crm_info.get("opportunityId")),
-    ]
+    """Resolves the owning tenant from data.crm, or raises if
+    ambiguous/unknown/unrecognized. See this module's docstring for how
+    the real payload shape was confirmed."""
+    crm = payload.get("data", {}).get("crm") or {}
+    crm_id = crm.get("id")
+    object_type = _CRM_TYPE_TO_OBJECT_TYPE.get((crm.get("type") or "").lower())
+
+    if not crm_id or object_type is None:
+        raise SybillTenantResolutionError(
+            f"No resolvable CRM reference in payload (crm={crm!r})"
+        )
 
     pool = await get_pool()
-    matched_hub_ids: set[str] = set()
-    for object_type, object_id in candidate_ids:
-        if not object_id:
-            continue
-        rows = await pool.fetch(
-            "SELECT DISTINCT hub_id FROM hubspot_object_index WHERE object_type = $1 AND object_id = $2",
-            object_type,
-            str(object_id),
-        )
-        matched_hub_ids.update(row["hub_id"] for row in rows)
+    rows = await pool.fetch(
+        "SELECT DISTINCT hub_id FROM hubspot_object_index WHERE object_type = $1 AND object_id = $2",
+        object_type,
+        str(crm_id),
+    )
+    matched_hub_ids = {row["hub_id"] for row in rows}
 
     if len(matched_hub_ids) != 1:
         raise SybillTenantResolutionError(
@@ -122,7 +149,6 @@ async def sybill_webhook(request: Request) -> dict:
         raise HTTPException(422, "Could not resolve owning tenant for this payload") from exc
 
     record = normalize_sybill_transcript(hub_id, payload)
-    record.pop("_meeting_title", None)
 
     api = Api(settings.airtable_api_key)
     table = api.base(settings.airtable_base_id).table(SYBILL_TABLE)

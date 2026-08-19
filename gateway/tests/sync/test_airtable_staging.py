@@ -67,6 +67,32 @@ def test_normalize_record_tags_by_client():
     assert "contact-1" in row["Data"]
 
 
+def test_normalize_record_reads_hs_object_id_from_properties():
+    # query_crm_data's real CRM object shape (COMPANY, DEAL, confirmed
+    # live) has no top-level "id" at all, only properties.hs_object_id —
+    # sync.hubspot_client.pull_crm_objects selects it explicitly.
+    row = normalize_record(
+        "hub_a", "COMPANY", {"objectTypeId": "0-2", "properties": {"hs_object_id": "443702868207", "name": "Acme"}}
+    )
+    assert row["Source ID"] == "443702868207"
+
+
+def test_normalize_record_prefers_hs_object_id_over_top_level_id():
+    row = normalize_record(
+        "hub_a", "COMPANY", {"id": "wrong", "properties": {"hs_object_id": "right"}}
+    )
+    assert row["Source ID"] == "right"
+
+
+def test_normalize_record_falls_back_to_top_level_id_when_no_properties():
+    # The generic per-object tools (e.g. get_organization_details) and
+    # campaign_data's per-campaign records use a top-level "id" instead of
+    # a properties dict — confirmed separately during this project's
+    # earlier live testing.
+    row = normalize_record("hub_a", "get_organization_details", {"id": "team-1", "name": "Sales"})
+    assert row["Source ID"] == "team-1"
+
+
 def test_ensure_schema_creates_only_missing_tables(fake_base):
     fake_base._existing.add("Contacts")
     airtable_staging.ensure_schema()

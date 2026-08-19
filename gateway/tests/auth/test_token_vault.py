@@ -7,7 +7,15 @@ import pytest
 
 from db import get_pool
 
-from auth import InMemoryAccessTokenCache, TokenVault, derive_tenant_key, encrypt, mcp_vault, token_vault
+from auth import (
+    InMemoryAccessTokenCache,
+    PostgresAccessTokenCache,
+    TokenVault,
+    derive_tenant_key,
+    encrypt,
+    mcp_vault,
+    token_vault,
+)
 
 
 async def _seed_tenant(
@@ -34,26 +42,79 @@ async def _seed_tenant(
     )
 
 
-def test_cache_set_get_round_trip():
+@pytest.mark.asyncio
+async def test_cache_set_get_round_trip():
     cache = InMemoryAccessTokenCache()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
-    cache.set("hub_1", "access-token", expires_at)
-    assert cache.get("hub_1") == "access-token"
+    await cache.set("hub_1", "access-token", expires_at)
+    assert await cache.get("hub_1") == "access-token"
 
 
-def test_cache_expired_entry_returns_none():
+@pytest.mark.asyncio
+async def test_cache_expired_entry_returns_none():
     cache = InMemoryAccessTokenCache()
     expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-    cache.set("hub_1", "access-token", expires_at)
-    assert cache.get("hub_1") is None
+    await cache.set("hub_1", "access-token", expires_at)
+    assert await cache.get("hub_1") is None
 
 
-def test_cache_invalidate_removes_entry():
+@pytest.mark.asyncio
+async def test_cache_invalidate_removes_entry():
     cache = InMemoryAccessTokenCache()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
-    cache.set("hub_1", "access-token", expires_at)
-    cache.invalidate("hub_1")
-    assert cache.get("hub_1") is None
+    await cache.set("hub_1", "access-token", expires_at)
+    await cache.invalidate("hub_1")
+    assert await cache.get("hub_1") is None
+
+
+def test_token_vault_defaults_to_postgres_backed_cache():
+    # The spec's required multi-instance baseline (Section 3.1) — not the
+    # in-process fallback, which silently breaks cache consistency the
+    # moment a second instance runs.
+    assert isinstance(TokenVault()._cache, PostgresAccessTokenCache)
+
+
+@pytest.mark.asyncio
+async def test_postgres_cache_visible_to_a_fresh_instance_that_never_wrote_it():
+    # The actual property this cache exists for: a *different* TokenVault/
+    # cache instance (simulating a second mcp-gateway process) sees the
+    # same cached value without ever having called get_access_token()
+    # itself first — proving it's genuinely shared, not per-process state.
+    await _seed_tenant(
+        "hub_cross_instance", "cross-instance-access", "cross-instance-refresh",
+        datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    fresh_cache = PostgresAccessTokenCache(table_name="tokens")
+    assert await fresh_cache.get("hub_cross_instance") == "cross-instance-access"
+
+
+@pytest.mark.asyncio
+async def test_postgres_cache_returns_none_for_expired_row():
+    await _seed_tenant(
+        "hub_cache_expired", "stale-access", "stale-refresh",
+        datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    cache = PostgresAccessTokenCache(table_name="tokens")
+    assert await cache.get("hub_cache_expired") is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_cache_returns_none_for_unknown_tenant():
+    cache = PostgresAccessTokenCache(table_name="tokens")
+    assert await cache.get("hub_never_seeded") is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_cache_returns_none_within_refresh_buffer():
+    # Regression case: a row inside the 5-minute refresh buffer (but not
+    # yet hard-expired) must be treated as a cache miss, or a near-expiry
+    # token would be served forever and proactive refresh would never run.
+    await _seed_tenant(
+        "hub_cache_near_expiry", "near-expiry-access", "near-expiry-refresh",
+        datetime.now(timezone.utc) + timedelta(minutes=2),
+    )
+    cache = PostgresAccessTokenCache(table_name="tokens")
+    assert await cache.get("hub_cache_near_expiry") is None
 
 
 @pytest.mark.asyncio

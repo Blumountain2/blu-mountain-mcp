@@ -27,25 +27,31 @@ _REPLAY_WINDOW_SECONDS = 5 * 60
 
 
 class AccessTokenCache(ABC):
-    """Pluggable cache interface. In-memory by default; could become Redis-backed
-    later without changing TokenVault's logic, per the spec's own note that
-    Redis is an optional upgrade, not a baseline requirement."""
+    """Pluggable cache interface. Async because a real multi-instance-shared
+    backing (PostgresAccessTokenCache below) can only ever be async — a
+    synchronous interface here would have made a Postgres-backed
+    implementation impossible to write correctly, which is exactly why
+    only the in-process fallback existed for a while."""
 
     @abstractmethod
-    def get(self, hub_id: str) -> str | None: ...
+    async def get(self, hub_id: str) -> str | None: ...
 
     @abstractmethod
-    def set(self, hub_id: str, access_token: str, expires_at: datetime) -> None: ...
+    async def set(self, hub_id: str, access_token: str, expires_at: datetime) -> None: ...
 
     @abstractmethod
-    def invalidate(self, hub_id: str) -> None: ...
+    async def invalidate(self, hub_id: str) -> None: ...
 
 
 class InMemoryAccessTokenCache(AccessTokenCache):
+    """Per-spec (Section 3.1), kept available behind the same interface for
+    local development; no longer TokenVault's default — see
+    PostgresAccessTokenCache below."""
+
     def __init__(self) -> None:
         self._store: dict[str, tuple[str, datetime]] = {}
 
-    def get(self, hub_id: str) -> str | None:
+    async def get(self, hub_id: str) -> str | None:
         entry = self._store.get(hub_id)
         if entry is None:
             return None
@@ -55,13 +61,63 @@ class InMemoryAccessTokenCache(AccessTokenCache):
             return None
         return access_token
 
-    def set(self, hub_id: str, access_token: str, expires_at: datetime) -> None:
+    async def set(self, hub_id: str, access_token: str, expires_at: datetime) -> None:
         # Refresh tokens are never placed in this cache (FR-5): only the
         # access token and its own expiry are stored here.
         self._store[hub_id] = (access_token, expires_at)
 
-    def invalidate(self, hub_id: str) -> None:
+    async def invalidate(self, hub_id: str) -> None:
         self._store.pop(hub_id, None)
+
+
+class PostgresAccessTokenCache(AccessTokenCache):
+    """The spec's required multi-instance baseline (Section 3.1: "Because
+    the deployment is multi-instance from launch, a Postgres-backed cache
+    is the baseline"). TokenVault's default as of this fix — previously
+    only InMemoryAccessTokenCache existed, which silently breaks cache
+    consistency the moment a second mcp-gateway instance runs.
+
+    Rather than a second table, this reads the same encrypted-token row
+    every TokenVault instance already persists to table_name — every
+    instance sees the same state for free, with no separate write path to
+    keep in sync. set()/invalidate() are deliberately no-ops:
+    get_access_token()'s own refresh path is what writes that row, and
+    invalidate_in_transaction() is what deletes it; a second write path
+    here would just be a second place for the two to drift apart. What
+    this actually saves over always falling through to get_access_token()'s
+    full path is the advisory-lock transaction on every call — this does a
+    lock-free read instead, only falling through on an actual miss (no
+    row, a decrypt failure, or past expiry)."""
+
+    def __init__(self, table_name: str) -> None:
+        self._table_name = table_name
+
+    async def get(self, hub_id: str) -> str | None:
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            f"SELECT encrypted_access_token, expires_at FROM {self._table_name} WHERE hub_id = $1",
+            hub_id,
+        )
+        # Must honor the same _REFRESH_BUFFER get_access_token()'s own
+        # refresh check uses, not just hard expiry — unlike
+        # InMemoryAccessTokenCache (only ever populated by a value that
+        # already passed that check), this reads a row that could be
+        # anyone's state, including one nobody has refreshed in a while.
+        # Without this, a near-expiry row would be served straight from
+        # here forever, since a hard-expiry-only check never sees it as a
+        # miss until it's already too late to refresh proactively.
+        if row is None or datetime.now(timezone.utc) >= row["expires_at"] - _REFRESH_BUFFER:
+            return None
+        try:
+            return decrypt(row["encrypted_access_token"], derive_tenant_key(hub_id))
+        except Exception:
+            return None
+
+    async def set(self, hub_id: str, access_token: str, expires_at: datetime) -> None:
+        pass
+
+    async def invalidate(self, hub_id: str) -> None:
+        pass
 
 
 # The per-table event names and uninstall-semantics are a deterministic
@@ -123,7 +179,7 @@ class TokenVault:
         if table_name not in _TOKEN_TABLE_CONFIG:
             raise ValueError(f"Unrecognized token table: {table_name}")
         config = _TOKEN_TABLE_CONFIG[table_name]
-        self._cache = cache or InMemoryAccessTokenCache()
+        self._cache = cache or PostgresAccessTokenCache(table_name)
         self._table_name = table_name
         # Bound once here, deliberately, not re-looked-up as a module global
         # inside get_access_token: this instance's refresh function is a
@@ -141,7 +197,7 @@ class TokenVault:
         """Returns a valid access token for this tenant, refreshing proactively
         (5-minute buffer) if needed. Serialized per tenant via advisory lock so
         concurrent instances never double-refresh the same tenant."""
-        cached = self._cache.get(hub_id)
+        cached = await self._cache.get(hub_id)
         if cached is not None:
             return cached
 
@@ -192,7 +248,7 @@ class TokenVault:
                     new_expires_at = expires_at
                     refreshed = False
 
-        self._cache.set(hub_id, access_token, new_expires_at)
+        await self._cache.set(hub_id, access_token, new_expires_at)
         if refreshed:
             await record_audit(self._refresh_event, hub_id=hub_id)
         return access_token
@@ -210,7 +266,7 @@ class TokenVault:
         rather than leaving one vault's row deleted and the other's
         orphaned. invalidate() below is just this wrapped in its own
         connection for the common single-vault case."""
-        self._cache.invalidate(hub_id)
+        await self._cache.invalidate(hub_id)
         await acquire_tenant_lock(conn, hub_id, self._table_name)
         await conn.execute(f"DELETE FROM {self._table_name} WHERE hub_id = $1", hub_id)
         if self._mark_tenant_uninstalled_on_invalidate:

@@ -49,6 +49,7 @@ class TokenResult:
     access_token: str
     refresh_token: str
     expires_at: datetime
+    hub_domain: str | None = None
 
 
 def generate_pkce_pair() -> tuple[str, str]:
@@ -75,16 +76,32 @@ def _parse_token_error(response: httpx.Response) -> HubSpotOAuthError:
 
 
 @router.get("/install")
-async def install() -> RedirectResponse:
-    """Starts Flow B: redirects the client portal admin to HubSpot's authorization URL."""
+async def install(portal_name: str | None = None) -> RedirectResponse:
+    """Starts Flow B: redirects the client portal admin to HubSpot's authorization URL.
+
+    portal_name is an optional human-readable name for this client (e.g.
+    "Blu Mountain & Gumpper"), supplied by whoever sends the install link —
+    HubSpot's API has no such field to fetch it from (confirmed: neither the
+    OAuth token responses nor the dedicated account-info endpoint carry a
+    company/display name, only technical fields like portalId/domain/
+    timezone). Carried across the redirect round-trip via oauth_states, the
+    same way code_verifier already is. A blank or whitespace-only value
+    (`?portal_name=` with nothing, or all spaces) is normalized to None here
+    rather than stored as an empty string — an empty string is not NULL to
+    Postgres, so it would otherwise defeat both the COALESCE that protects
+    an existing name from being cleared on reinstall and the COALESCE that
+    falls back to hub_domain when read, making a careless blank param
+    actively worse than not passing one at all."""
+    portal_name = (portal_name or "").strip() or None
     code_verifier, code_challenge = generate_pkce_pair()
     state = secrets.token_urlsafe(32)
 
     pool = await get_pool()
     await pool.execute(
-        "INSERT INTO oauth_states (state, code_verifier) VALUES ($1, $2)",
+        "INSERT INTO oauth_states (state, code_verifier, portal_name) VALUES ($1, $2, $3)",
         state,
         code_verifier,
+        portal_name,
     )
 
     params = {
@@ -118,7 +135,7 @@ async def callback(request: Request) -> HTMLResponse:
     pool = await get_pool()
     row = await pool.fetchrow(
         "DELETE FROM oauth_states WHERE state = $1 AND created_at > now() - $2::interval "
-        "RETURNING code_verifier",
+        "RETURNING code_verifier, portal_name",
         state,
         _STATE_TTL,
     )
@@ -134,6 +151,7 @@ async def callback(request: Request) -> HTMLResponse:
         )
 
     code_verifier = row["code_verifier"]
+    portal_name = row["portal_name"]
 
     try:
         result = await exchange_code(code, code_verifier)
@@ -148,7 +166,7 @@ async def callback(request: Request) -> HTMLResponse:
             retry_path="/install",
         )
 
-    await _persist_new_tenant(result)
+    await _persist_new_tenant(result, portal_name)
 
     await record_audit("hubspot_install_completed", hub_id=result.hub_id)
 
@@ -188,13 +206,14 @@ async def exchange_code(code: str, code_verifier: str) -> TokenResult:
         refresh_token = body["refresh_token"]
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=body["expires_in"])
 
-        hub_id = await _fetch_hub_id(client, access_token)
+        hub_id, hub_domain = await _fetch_hub_id_and_domain(client, access_token)
 
     return TokenResult(
         hub_id=hub_id,
         access_token=access_token,
         refresh_token=refresh_token,
         expires_at=expires_at,
+        hub_domain=hub_domain,
     )
 
 
@@ -218,14 +237,25 @@ async def refresh_token_pair(refresh_token: str) -> tuple[str, str, datetime]:
         return body["access_token"], body["refresh_token"], expires_at
 
 
-async def _fetch_hub_id(client: httpx.AsyncClient, access_token: str) -> str:
+async def _fetch_hub_id_and_domain(
+    client: httpx.AsyncClient, access_token: str
+) -> tuple[str, str | None]:
+    """Confirmed live: this response also carries hub_domain (HubSpot's own
+    example: "hub_domain": "meowmix.com") — a real, human-recognizable
+    identifier for the portal, fetched here for free since this call already
+    happens on every install. HubSpot has no API for a portal's actual
+    company/display name (confirmed against its account-info endpoint and
+    community docs), so hub_domain is the best automatic fallback available,
+    not a substitute for a manually-supplied name (see /install's
+    portal_name param)."""
     response = await client.get(ACCESS_TOKEN_INFO_URL.format(token=access_token))
     if response.status_code != 200:
         raise _parse_token_error(response)
-    return str(response.json()["hub_id"])
+    body = response.json()
+    return str(body["hub_id"]), body.get("hub_domain")
 
 
-async def _persist_new_tenant(result: TokenResult) -> None:
+async def _persist_new_tenant(result: TokenResult, portal_name: str | None = None) -> None:
     from .crypto import derive_tenant_key, encrypt
 
     key = derive_tenant_key(result.hub_id)
@@ -234,11 +264,17 @@ async def _persist_new_tenant(result: TokenResult) -> None:
         async with conn.transaction():
             await conn.execute(
                 """
-                INSERT INTO tenants (hub_id, install_status)
-                VALUES ($1, 'installed')
-                ON CONFLICT (hub_id) DO UPDATE SET install_status = 'installed', updated_at = now()
+                INSERT INTO tenants (hub_id, portal_name, hub_domain, install_status)
+                VALUES ($1, NULLIF(TRIM($2), ''), NULLIF(TRIM($3), ''), 'installed')
+                ON CONFLICT (hub_id) DO UPDATE SET
+                    install_status = 'installed',
+                    portal_name = COALESCE(NULLIF(TRIM(EXCLUDED.portal_name), ''), tenants.portal_name),
+                    hub_domain = COALESCE(NULLIF(TRIM(EXCLUDED.hub_domain), ''), tenants.hub_domain),
+                    updated_at = now()
                 """,
                 result.hub_id,
+                portal_name,
+                result.hub_domain,
             )
             await conn.execute(
                 """

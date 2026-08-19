@@ -494,11 +494,22 @@ class HubSpotDataPullClient:
         query_crm_data — the one tool that can read contacts, companies,
         deals, tickets, etc. (see this module's docstring for why these
         can't go through list_read_only_tools()'s generic name-based
-        filter). Each query is a fixed "SELECT * FROM {TYPE}" authored
-        here, never from external input. All object types are pulled
-        concurrently — each is independent and already isolates its own
-        failure into its own result key, so there's nothing serialization
-        would protect here, only latency it would add.
+        filter). Each query is a fixed "SELECT hs_object_id, * FROM {TYPE}"
+        authored here, never from external input. All object types are
+        pulled concurrently — each is independent and already isolates its
+        own failure into its own result key, so there's nothing
+        serialization would protect here, only latency it would add.
+
+        hs_object_id is selected explicitly, not left to "*" alone —
+        confirmed live that HubSpot's default property set for every CRM
+        object type excludes its own object ID, and "id" isn't a valid
+        property name at all (HubSpot's own error names hs_object_id as
+        the real one). Without it, every pulled row is missing the one
+        field sync.airtable_staging._index_crm_objects needs to populate
+        hubspot_object_index, which is what Sybill's tenant resolution
+        looks up — confirmed live: that table stayed empty for every
+        tenant this pulled, with no error anywhere in the pull itself,
+        since a missing Source ID is silently skipped, not raised.
 
         object_types defaults to the full CRM_OBJECT_TYPES (pull_all()'s
         use), but a caller that only needs a subset (session/live_session.py's
@@ -508,7 +519,7 @@ class HubSpotDataPullClient:
         types = object_types if object_types is not None else CRM_OBJECT_TYPES
 
         async def _pull_one(object_type: str) -> tuple[str, object]:
-            sql = f"SELECT * FROM {object_type}"
+            sql = f"SELECT hs_object_id, * FROM {object_type}"
             try:
                 return object_type, await self.pull_object("query_crm_data", client=client, sql=sql)
             except Exception as exc:
