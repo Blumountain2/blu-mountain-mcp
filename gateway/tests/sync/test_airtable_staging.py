@@ -2,11 +2,13 @@
 client and never lets one tenant's pull write into another tenant's rows,
 using a fake Airtable API so no real base is touched."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from db import get_pool
 from sync import airtable_staging
-from sync.airtable_staging import normalize_record, stage_tenant_pull
+from sync.airtable_staging import normalize_record, run_staging_cycle, stage_tenant_pull
 
 
 class _FakeTableSchema:
@@ -154,6 +156,33 @@ async def test_stage_tenant_pull_stages_organization_landing_page_and_blog_post(
 
 
 @pytest.mark.asyncio
+async def test_stage_tenant_pull_stages_quote_records(fake_base):
+    # QUOTE (added to CRM_OBJECT_TYPES 2026-09-02) previously had no
+    # matching OBJECT_TABLES keyword either, the same silent-drop failure
+    # mode as the organization/LANDING_PAGE/BLOG_POST case above.
+    pulled = {"QUOTE": [{"properties": {"hs_object_id": "q-1"}}]}
+    await stage_tenant_pull("hub_a", pulled)
+
+    assert fake_base.written["Quotes"][0]["Source ID"] == "q-1"
+
+
+@pytest.mark.asyncio
+async def test_marketing_email_analytics_does_not_collide_with_real_email_records(fake_base):
+    # "email" is a substring of "marketing_email_analytics", so the
+    # generic capability's one portal-wide stats dict previously landed in
+    # the same "Emails" table as real per-engagement EMAIL CRM records —
+    # two structurally unrelated row shapes sharing one table.
+    pulled = {
+        "EMAIL": [{"properties": {"hs_object_id": "e-1"}}],
+        "marketing_email_analytics": {"id": "stats-1"},
+    }
+    await stage_tenant_pull("hub_a", pulled)
+
+    assert [r["Source ID"] for r in fake_base.written["Emails"]] == ["e-1"]
+    assert fake_base.written["MarketingEmailAnalytics"][0]["Source ID"] == "stats-1"
+
+
+@pytest.mark.asyncio
 async def test_stage_tenant_pull_stages_campaign_data_list_as_one_row_per_campaign(fake_base):
     # pull_campaign_data() returns a list of per-campaign records (each
     # carrying its own "id"), the same shape as every other object type —
@@ -205,3 +234,26 @@ async def test_hubspot_object_index_isolated_per_tenant_even_with_same_object_id
     )
     hub_ids = {row["hub_id"] for row in rows}
     assert hub_ids == {"hub_a", "hub_b"}
+
+
+@pytest.mark.asyncio
+async def test_run_staging_cycle_survives_failure_listing_tenants(monkeypatch):
+    """Regression test: get_installed_hub_ids() used to sit outside any
+    try/except in run_staging_cycle, so a failure there would escape the
+    function entirely instead of being logged and recorded the same way
+    every other failure in this function is."""
+    monkeypatch.setattr(
+        airtable_staging, "get_installed_hub_ids", AsyncMock(side_effect=RuntimeError("db unreachable"))
+    )
+    # run_staging_cycle now delegates the "record this failure, best-effort"
+    # step to the shared auth.record_audit_best_effort helper (see
+    # auth/security.py) rather than calling record_audit directly.
+    best_effort_mock = AsyncMock()
+    monkeypatch.setattr(airtable_staging, "record_audit_best_effort", best_effort_mock)
+
+    await run_staging_cycle()  # must not raise
+
+    best_effort_mock.assert_awaited_once()
+    args, kwargs = best_effort_mock.call_args
+    assert args[0] == "staging_cycle_failed"
+    assert kwargs["detail"]["stage"] == "list_tenants"

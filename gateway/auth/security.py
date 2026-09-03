@@ -33,6 +33,22 @@ async def record_audit(
     )
 
 
+async def record_audit_best_effort(event_type: str, hub_id: str | None = None, detail: dict | None = None) -> None:
+    """record_audit, but if the audit write itself fails too — most
+    plausibly the same outage that caused whatever this is recording —
+    logs that via this module's own logger instead of letting a second
+    failure propagate and mask or abort handling of the first. Shared by
+    every "the thing we were trying to record already failed, don't let
+    recording that failure also crash the caller" site in this project
+    (main.py's audit-log purge job, sync/airtable_staging.py's per-tenant
+    and list-tenants failure paths) — previously each reimplemented this
+    same try/except verbatim."""
+    try:
+        await record_audit(event_type, hub_id=hub_id, detail=detail)
+    except Exception as audit_exc:
+        logger.error(f"{event_type}.audit_also_failed", hub_id=hub_id, error=str(audit_exc))
+
+
 async def purge_expired_audit_log() -> int:
     """Deletes audit entries older than the configured retention window.
     Retention is a minimum, not a maximum, so this only prunes rows well past it."""

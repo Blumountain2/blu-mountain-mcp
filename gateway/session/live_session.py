@@ -24,15 +24,20 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token
 
-from auth import mcp_vault, record_audit
+from auth import record_audit
 from config import settings
 from db import get_pool
 from sync import HubSpotDataPullClient
 from sync.hubspot_client import (
+    CATEGORY_CRM_RECORDS,
+    CATEGORY_ENGAGEMENT_RECORDS,
+    CATEGORY_GENERIC_CAPABILITIES as CATEGORY_GENERIC_TOOLS,
+    CATEGORY_MARKETING_CONTENT,
+    CATEGORY_USERS,
     CRM_OBJECT_ALIASES,
     CRM_OBJECT_TYPES,
     GENERIC_TOOL_QUERY_ALIASES,
-    PER_ITEM_TOOLS,
+    OBJECT_TYPE_CATEGORIES,
 )
 
 logger = structlog.get_logger()
@@ -60,6 +65,13 @@ def _build_auth() -> GoogleProvider:
         client_secret=settings.fastmcp_google_client_secret,
         base_url=settings.fastmcp_base_url,
         required_scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
+        # FASTMCP_ACCESS_TOKEN_TTL_MINUTES was documented in .env.example
+        # ("the real revocation window") since before this project's
+        # config-audit pass, but was never actually passed here — FastMCP's
+        # own default expiry was silently governing every issued session
+        # token instead. GoogleProvider's real parameter name is in
+        # seconds, not minutes.
+        fastmcp_access_token_expiry_seconds=settings.fastmcp_access_token_ttl_minutes * 60,
     )
 
 
@@ -316,20 +328,34 @@ async def select_tenant(tenant: str) -> dict:
     await _deny_tenant_access(email, tenant, "no_match")
 
 
-@mcp.tool
-async def query_hubspot_data(object_type: str) -> dict:
-    """Returns read-only HubSpot data for the session's selected tenant,
-    for one in-scope object type (e.g. 'contacts', 'deals', 'campaign').
+def _category_object_types(category: str) -> set[str]:
+    return {t for t, c in OBJECT_TYPE_CATEGORIES.items() if c == category}
 
-    Matches against all three of sync/hubspot_client.py's read paths, not
-    just its generic per-object tools: the core CRM object set (contacts,
-    deals, companies, etc.) has no per-object tool at all and is only
-    reachable via query_crm_data/CRM_OBJECT_TYPES, and campaign metrics
-    always need pull_campaign_data()'s per-campaign-ID handling rather than
-    a bare call to read_campaign_data (which requires an ID this tool
-    never has). Missing either path here previously meant this tool
-    silently returned nothing for the objects staff would ask for most, or
-    crashed outright on a campaign query."""
+
+async def _query_category(category: str, object_type: str, properties: list[str] | None = None) -> dict:
+    """Shared implementation behind the four category-scoped tools below
+    (openspec/changes/separate-vertical-client-agents, task 6.1/6.2/6.3 —
+    replaces the single generic query_hubspot_data). Matches against all
+    three of sync/hubspot_client.py's read paths, not just its generic
+    per-object tools: the core CRM object set (contacts, deals, companies,
+    etc.) has no per-object tool at all and is only reachable via
+    query_crm_data/CRM_OBJECT_TYPES, and campaign metrics always need
+    pull_campaign_data()'s per-campaign-ID handling rather than a bare call
+    to read_campaign_data (which requires an ID this tool never has).
+
+    CRM object types and CAMPAIGN are strictly gated by category — a real
+    object type that exists but belongs to a different category tool is
+    rejected explicitly with an {"error": ...} result, not silently
+    returned empty, so a caller learns to call the right tool instead of
+    assuming no data exists at all. Generic tools are gated the same way,
+    via CATEGORY_GENERIC_TOOLS above.
+
+    properties (task 6.3): an optional explicit column list, forwarded to
+    pull_crm_objects for every matched CRM object type — this is what lets
+    a category tool be scoped to a client's own confirmed-relevant or
+    custom fields (from its onboarding profile/client agent instance),
+    rather than always returning HubSpot's small default property set.
+    Omitting it keeps today's default behavior unchanged."""
     email, session_key = await _require_staff_identity()
     hub_id = await _resolve_selected_tenant(email, session_key)
 
@@ -341,37 +367,46 @@ async def query_hubspot_data(object_type: str) -> dict:
     # connection-reuse — a single interactive query can otherwise trigger
     # a CRM-type call, a campaign lookup, several per-campaign metric
     # calls, and a tool-discovery call, each opening its own connection.
-    access_token = await mcp_vault.get_access_token(hub_id)
-    mcp_client = await client._client(access_token)
+    http_client, headers = await client._client_for_hub()
 
-    async with mcp_client:
-        # CRM_OBJECT_ALIASES handles irregular plurals/compound names a
-        # bare substring check misses ("companies" vs "COMPANY", "landing
-        # pages" vs "LANDING_PAGE") — see hubspot_client.py for why.
-        matching_crm_types = [
-            t for t in CRM_OBJECT_TYPES if lowered in CRM_OBJECT_ALIASES.get(t, set())
-        ]
-        if matching_crm_types:
+    category_types = _category_object_types(category)
+    # CRM_OBJECT_ALIASES handles irregular plurals/compound names a bare
+    # substring check misses ("companies" vs "COMPANY", "landing pages" vs
+    # "LANDING_PAGE") — see hubspot_client.py for why.
+    all_matching_types = [t for t in CRM_OBJECT_TYPES if lowered in CRM_OBJECT_ALIASES.get(t, set())]
+    in_category_types = [t for t in all_matching_types if t in category_types]
+
+    async with http_client:
+        if all_matching_types and not in_category_types:
+            await _audit(
+                email, hub_id, "live_query_wrong_category", {"object_type": object_type, "category": category}
+            )
+            return {"error": f"{object_type!r} is not in this tool's category; call the matching category tool instead"}
+
+        if in_category_types:
+            properties_map = {t: properties for t in in_category_types} if properties else None
             result.update(
-                await client.pull_crm_objects(client=mcp_client, object_types=matching_crm_types)
+                await client.pull_crm_objects(
+                    client=http_client, headers=headers, object_types=in_category_types, properties=properties_map
+                )
             )
 
-        if lowered in CRM_OBJECT_ALIASES["CAMPAIGN"]:
-            result["campaign_data"] = await client.pull_campaign_data(client=mcp_client)
+        if category == CATEGORY_MARKETING_CONTENT and lowered in CRM_OBJECT_ALIASES["CAMPAIGN"]:
+            result["campaign_data"] = await client.pull_campaign_data(client=http_client, headers=headers)
 
         # "team"/"teams" has no CRM_OBJECT_TYPES entry — its only real path
-        # is get_organization_details, matched here via the same
+        # is the organization_details capability, matched here via the same
         # organization-means-teams translation hubspot_client.py's own
-        # IN_SCOPE_OBJECT_KEYWORDS already relies on for the scheduled pull.
+        # generic-capability categorization already relies on for the
+        # scheduled pull.
         query_term = GENERIC_TOOL_QUERY_ALIASES.get(lowered, lowered)
-        tools = await client.list_read_only_tools(client=mcp_client)
-        matching_tools = [
-            t for t in tools if query_term in t.lower() and t not in PER_ITEM_TOOLS
-        ]
+        category_generic_tools = CATEGORY_GENERIC_TOOLS.get(category, set())
+        tools = await client.list_read_only_tools(client=http_client)
+        matching_tools = [t for t in tools if t in category_generic_tools and query_term in t.lower()]
 
         async def _pull_tool(tool_name: str) -> tuple[str, object]:
             try:
-                return tool_name, await client.pull_object(tool_name, client=mcp_client)
+                return tool_name, await client.pull_object(tool_name, client=http_client, headers=headers)
             except Exception as exc:
                 client.log_pull_failure(tool_name, exc)
                 return tool_name, {"error": "pull_failed"}
@@ -379,14 +414,55 @@ async def query_hubspot_data(object_type: str) -> dict:
         tool_pairs = await asyncio.gather(*(_pull_tool(t) for t in matching_tools))
         result.update(dict(tool_pairs))
 
-    await _audit(email, hub_id, "live_query", {"object_type": object_type})
-    logger.info("live_session.query", staff=email, hub_id=hub_id, object_type=object_type)
+    await _audit(email, hub_id, "live_query", {"object_type": object_type, "category": category})
+    logger.info("live_session.query", staff=email, hub_id=hub_id, object_type=object_type, category=category)
     return result
+
+
+@mcp.tool
+async def query_crm_records(object_type: str, properties: list[str] | None = None) -> dict:
+    """Returns read-only HubSpot CRM record data for the session's selected
+    tenant: 'contacts', 'companies', 'deals', 'tickets', 'line_items', or
+    'products'. Optionally pass `properties` (a list of exact HubSpot
+    internal property names, including custom/portal-specific ones) to
+    return exactly those fields instead of HubSpot's own default set —
+    confirmed live this narrows the response rather than adding to it; omit
+    it to get just the default set."""
+    return await _query_category(CATEGORY_CRM_RECORDS, object_type, properties)
+
+
+@mcp.tool
+async def query_engagement_records(object_type: str, properties: list[str] | None = None) -> dict:
+    """Returns read-only HubSpot engagement/activity data for the session's
+    selected tenant: 'calls', 'emails', 'meetings', 'notes', or 'tasks'.
+    Optionally pass `properties` (exact HubSpot internal property names,
+    including custom ones) to return exactly those fields instead of
+    HubSpot's own default set."""
+    return await _query_category(CATEGORY_ENGAGEMENT_RECORDS, object_type, properties)
+
+
+@mcp.tool
+async def query_marketing_content(object_type: str, properties: list[str] | None = None) -> dict:
+    """Returns read-only HubSpot marketing/content data for the session's
+    selected tenant: 'campaign', 'landing_pages', 'blog_posts', or 'lists'
+    (segments), plus content/campaign analytics tools where applicable.
+    Optionally pass `properties` to return exactly those fields instead of
+    HubSpot's own default set, for CRM-backed object types."""
+    return await _query_category(CATEGORY_MARKETING_CONTENT, object_type, properties)
+
+
+@mcp.tool
+async def query_users(object_type: str, properties: list[str] | None = None) -> dict:
+    """Returns read-only HubSpot user/team data for the session's selected
+    tenant: 'users', 'owners', or 'teams' (organization-wide team/seat/role
+    info). Optionally pass `properties` to return exactly those fields
+    instead of HubSpot's own default set, for the 'users' object type."""
+    return await _query_category(CATEGORY_USERS, object_type, properties)
 
 
 # Prompts return static instruction text only — they never touch the vault,
 # Postgres, or HubSpot themselves. All real data access still goes through
-# select_tenant/query_hubspot_data above, so nothing here needs its own
+# select_tenant/the four category-scoped query_* tools above, so nothing here needs its own
 # staff-identity or tenant-permission check; a prompt can't leak anything a
 # tool call wouldn't already guard. A first, deliberately small pair, not a
 # full library — real staff usage (none exists yet, since no client is
@@ -408,7 +484,7 @@ def tenant_pipeline_overview(tenant: str) -> str:
     return (
         f"Select the tenant '{tenant}' (call select_tenant; if the result "
         "is ambiguous, ask me which candidate is meant rather than "
-        "guessing). Then call query_hubspot_data for 'deals' and "
+        "guessing). Then call query_crm_records for 'deals' and "
         "'companies'. Summarize the open pipeline: how many deals are "
         "open, their total value if the amount field is populated, and "
         "which companies have the most active deals."
@@ -422,7 +498,7 @@ def tenant_recent_activity(tenant: str) -> str:
     return (
         f"Select the tenant '{tenant}' (call select_tenant; if the result "
         "is ambiguous, ask me which candidate is meant rather than "
-        "guessing). Then call query_hubspot_data for 'calls', 'emails', "
-        "and 'meetings'. Summarize recent activity: roughly how much of "
-        "each kind happened, and anything notable worth flagging."
+        "guessing). Then call query_engagement_records for 'calls', "
+        "'emails', and 'meetings'. Summarize recent activity: roughly how "
+        "much of each kind happened, and anything notable worth flagging."
     )

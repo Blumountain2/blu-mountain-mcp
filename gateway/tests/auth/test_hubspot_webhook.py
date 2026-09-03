@@ -96,50 +96,10 @@ async def test_uninstall_webhook_accepts_valid_signature_and_invalidates_tenant(
 
 
 @pytest.mark.asyncio
-async def test_uninstall_webhook_also_invalidates_mcp_auth_token():
-    pool = await get_pool()
-    key = derive_tenant_key("789")
-    await pool.execute("INSERT INTO tenants (hub_id) VALUES ($1)", "789")
-    await pool.execute(
-        """
-        INSERT INTO tokens (hub_id, encrypted_access_token, encrypted_refresh_token, expires_at)
-        VALUES ($1, $2, $3, now() + interval '1 hour')
-        """,
-        "789",
-        encrypt("access", key),
-        encrypt("refresh", key),
-    )
-    await pool.execute(
-        """
-        INSERT INTO mcp_tokens (hub_id, encrypted_access_token, encrypted_refresh_token, expires_at)
-        VALUES ($1, $2, $3, now() + interval '1 hour')
-        """,
-        "789",
-        encrypt("mcp-access", key),
-        encrypt("mcp-refresh", key),
-    )
-
-    body = b'{"portalId": "789"}'
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            "/webhooks/hubspot/uninstall",
-            content=body,
-            headers={
-                "X-HubSpot-Signature-V3": _sign(body),
-                "X-HubSpot-Request-Timestamp": str(int(time.time() * 1000)),
-            },
-        )
-
-    assert response.status_code == 200
-    mcp_token_row = await pool.fetchrow("SELECT * FROM mcp_tokens WHERE hub_id = $1", "789")
-    assert mcp_token_row is None
-
-
-@pytest.mark.asyncio
-async def test_uninstall_webhook_never_touches_another_tenants_mcp_token():
-    """Cross-tenant isolation for the atomic vault+mcp_vault invalidation:
-    uninstalling one tenant must never delete or affect another tenant's
-    mcp_tokens row, tokens row, or install_status."""
+async def test_uninstall_webhook_never_touches_another_tenants_token():
+    """Cross-tenant isolation for invalidate_in_transaction: uninstalling
+    one tenant must never delete or affect another tenant's tokens row or
+    install_status."""
     pool = await get_pool()
     key_uninstalled = derive_tenant_key("uninstall-me")
     key_other = derive_tenant_key("leave-me-alone")
@@ -155,15 +115,6 @@ async def test_uninstall_webhook_never_touches_another_tenants_mcp_token():
             encrypt("access", key),
             encrypt("refresh", key),
         )
-        await pool.execute(
-            """
-            INSERT INTO mcp_tokens (hub_id, encrypted_access_token, encrypted_refresh_token, expires_at)
-            VALUES ($1, $2, $3, now() + interval '1 hour')
-            """,
-            hub_id,
-            encrypt("mcp-access", key),
-            encrypt("mcp-refresh", key),
-        )
 
     body = b'{"portalId": "uninstall-me"}'
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -178,13 +129,10 @@ async def test_uninstall_webhook_never_touches_another_tenants_mcp_token():
 
     assert response.status_code == 200
     assert await pool.fetchrow("SELECT * FROM tokens WHERE hub_id = $1", "uninstall-me") is None
-    assert await pool.fetchrow("SELECT * FROM mcp_tokens WHERE hub_id = $1", "uninstall-me") is None
 
     other_token_row = await pool.fetchrow("SELECT * FROM tokens WHERE hub_id = $1", "leave-me-alone")
-    other_mcp_row = await pool.fetchrow("SELECT * FROM mcp_tokens WHERE hub_id = $1", "leave-me-alone")
     other_tenant_row = await pool.fetchrow(
         "SELECT install_status FROM tenants WHERE hub_id = $1", "leave-me-alone"
     )
     assert other_token_row is not None
-    assert other_mcp_row is not None
     assert other_tenant_row["install_status"] == "installed"

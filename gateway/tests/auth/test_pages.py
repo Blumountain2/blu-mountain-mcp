@@ -36,7 +36,7 @@ def test_install_success_page_escapes_next_url_host():
     request = _fake_request('http://"><script>evil</script>.example.com')
     response = install_success_page(
         "Connected", "148997330", "Done.", request=request,
-        next_path="/install/mcp-auth", next_label="Continue",
+        next_path="/next-step", next_label="Continue",
     )
     body = response.body.decode()
     assert "<script>evil</script>" not in body

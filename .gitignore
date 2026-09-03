@@ -89,6 +89,14 @@ npm-debug.log*
 # Local notes
 context/Hubspot/
 
+# Real client data (Blu Mountain's own documentation on the analysis-template
+# plan) — never committed
+context/Blu Mountain Documentation/
+
+# Synthesizes specifics from the client documentation above (real
+# benchmarks, principles, internal architecture) — same protection
+context/BUILD_COMPARISON.md
+
 # HubSpot config file
 hubspot.config.yml
 

@@ -13,7 +13,6 @@ from auth import (
     TokenVault,
     derive_tenant_key,
     encrypt,
-    mcp_vault,
     token_vault,
 )
 
@@ -23,7 +22,6 @@ async def _seed_tenant(
     access_token: str,
     refresh_token: str,
     expires_at: datetime,
-    table: str = "tokens",
 ):
     pool = await get_pool()
     key = derive_tenant_key(hub_id)
@@ -31,8 +29,8 @@ async def _seed_tenant(
         "INSERT INTO tenants (hub_id) VALUES ($1) ON CONFLICT (hub_id) DO NOTHING", hub_id
     )
     await pool.execute(
-        f"""
-        INSERT INTO {table} (hub_id, encrypted_access_token, encrypted_refresh_token, expires_at)
+        """
+        INSERT INTO tokens (hub_id, encrypted_access_token, encrypted_refresh_token, expires_at)
         VALUES ($1, $2, $3, $4)
         """,
         hub_id,
@@ -155,6 +153,36 @@ async def test_get_access_token_refreshes_within_buffer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_access_token_succeeds_even_if_the_audit_write_fails(monkeypatch):
+    # get_access_token's refresh audit write previously used record_audit
+    # (unguarded) rather than record_audit_best_effort — a transient
+    # audit_log insert failure right after a successful refresh made this
+    # method raise to its caller even though the refresh itself had
+    # already committed. record_audit_best_effort catches that failure
+    # internally and logs it instead, so a real HubSpot pull isn't
+    # rejected for an unrelated audit-log hiccup.
+    await _seed_tenant(
+        "hub_audit_fail", "old-access", "old-refresh",
+        datetime.now(timezone.utc) + timedelta(minutes=2),
+    )
+    new_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    refresh_mock = AsyncMock(return_value=("new-access", "new-refresh", new_expiry))
+    monkeypatch.setattr(token_vault, "refresh_token_pair", refresh_mock)
+
+    from auth import security
+
+    async def failing_record_audit(*args, **kwargs):
+        raise RuntimeError("audit_log insert failed")
+
+    monkeypatch.setattr(security, "record_audit", failing_record_audit)
+
+    vault = TokenVault()
+    token = await vault.get_access_token("hub_audit_fail")
+
+    assert token == "new-access"
+
+
+@pytest.mark.asyncio
 async def test_get_access_token_uses_cache_on_second_call(monkeypatch):
     await _seed_tenant(
         "hub_cached", "cached-access", "cached-refresh",
@@ -189,69 +217,27 @@ async def test_invalidate_removes_token_and_marks_uninstalled():
     assert tenant_row["install_status"] == "uninstalled"
 
 
-# mcp_vault: same TokenVault logic, parameterized against mcp_tokens with
-# its own refresh_fn (mcp_auth.refresh_token_pair) and its own refresh/
-# invalidate audit event names, and it must never mark a tenant uninstalled
-# on invalidate (that's still owned exclusively by the Public App's vault).
-
-
 @pytest.mark.asyncio
-async def test_mcp_vault_reads_from_mcp_tokens_table():
+async def test_invalidate_succeeds_even_if_the_audit_write_fails(monkeypatch):
     await _seed_tenant(
-        "hub_mcp_far", "mcp-current-access", "mcp-current-refresh",
+        "hub_uninstall_audit_fail", "access", "refresh",
         datetime.now(timezone.utc) + timedelta(hours=1),
-        table="mcp_tokens",
     )
 
-    token = await mcp_vault.get_access_token("hub_mcp_far")
+    from auth import security
 
-    assert token == "mcp-current-access"
+    async def failing_record_audit(*args, **kwargs):
+        raise RuntimeError("audit_log insert failed")
 
+    monkeypatch.setattr(security, "record_audit", failing_record_audit)
 
-@pytest.mark.asyncio
-async def test_mcp_vault_refreshes_within_buffer_using_mcp_refresh_fn(monkeypatch):
-    from auth import mcp_auth
-
-    await _seed_tenant(
-        "hub_mcp_near", "mcp-old-access", "mcp-old-refresh",
-        datetime.now(timezone.utc) + timedelta(minutes=2),
-        table="mcp_tokens",
-    )
-    new_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
-    refresh_mock = AsyncMock(return_value=("mcp-new-access", "mcp-new-refresh", new_expiry))
-    monkeypatch.setattr(mcp_auth, "refresh_token_pair", refresh_mock)
-
-    fresh_mcp_vault = token_vault._mcp_vault()
-    token = await fresh_mcp_vault.get_access_token("hub_mcp_near")
-
-    assert token == "mcp-new-access"
-    refresh_mock.assert_called_once_with("mcp-old-refresh")
+    vault = TokenVault()
+    await vault.invalidate("hub_uninstall_audit_fail")
 
     pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT expires_at FROM mcp_tokens WHERE hub_id = $1", "hub_mcp_near"
-    )
-    assert row["expires_at"] > datetime.now(timezone.utc) + timedelta(minutes=30)
-
-
-@pytest.mark.asyncio
-async def test_mcp_vault_invalidate_does_not_mark_tenant_uninstalled():
-    await _seed_tenant(
-        "hub_mcp_uninstall", "mcp-access", "mcp-refresh",
-        datetime.now(timezone.utc) + timedelta(hours=1),
-        table="mcp_tokens",
-    )
-    await mcp_vault.invalidate("hub_mcp_uninstall")
-
-    pool = await get_pool()
-    token_row = await pool.fetchrow(
-        "SELECT * FROM mcp_tokens WHERE hub_id = $1", "hub_mcp_uninstall"
-    )
+    token_row = await pool.fetchrow("SELECT * FROM tokens WHERE hub_id = $1", "hub_uninstall_audit_fail")
     tenant_row = await pool.fetchrow(
-        "SELECT install_status FROM tenants WHERE hub_id = $1", "hub_mcp_uninstall"
+        "SELECT install_status FROM tenants WHERE hub_id = $1", "hub_uninstall_audit_fail"
     )
     assert token_row is None
-    # Deliberately unaffected: mark_tenant_uninstalled_on_invalidate=False
-    # for mcp_vault, since the Public App install/uninstall is the sole
-    # owner of a tenant's overall install_status.
-    assert tenant_row["install_status"] == "installed"
+    assert tenant_row["install_status"] == "uninstalled"

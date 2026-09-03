@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import structlog
 from pyairtable import Api
 
-from auth import check_rate_limit, get_installed_hub_ids, record_audit
+from auth import check_rate_limit, get_installed_hub_ids, record_audit, record_audit_best_effort
 from config import settings
 from db import get_pool
 
@@ -36,7 +36,16 @@ OBJECT_TABLES = {
     "line_item": "LineItems",
     "line item": "LineItems",
     "product": "Products",
+    "quote": "Quotes",
     "call": "Calls",
+    # Checked before the plain "email" entry below (dict order matters:
+    # _table_for_tool returns the FIRST matching keyword) — the
+    # marketing_email_analytics generic capability returns one portal-wide
+    # stats dict, a structurally different shape from EMAIL's real
+    # per-engagement CRM records, so it needs its own table rather than
+    # silently collapsing into "Emails" (the same reasoning as
+    # campaign_data/campaign directly below).
+    "marketing_email_analytics": "MarketingEmailAnalytics",
     "email": "Emails",
     "meeting": "Meetings",
     "note": "Notes",
@@ -197,7 +206,17 @@ async def _index_crm_objects(hub_id: str, by_table: dict[str, list[dict]]) -> No
 async def run_staging_cycle() -> None:
     """The scheduled job: pulls, normalizes, and writes every active tenant's
     data end to end (FR-11). Runs on SYNC_INTERVAL_MINUTES via APScheduler."""
-    hub_ids = await get_installed_hub_ids()
+    try:
+        hub_ids = await get_installed_hub_ids()
+    except Exception as exc:
+        # Same reasoning as the per-tenant except block below: this used to
+        # sit outside any try/except at all, so a failure here (most
+        # plausibly a Postgres blip) would escape straight to APScheduler's
+        # own internal logger instead of this project's audit_log — now
+        # caught the same way every other failure in this function is.
+        logger.error("airtable_staging.cycle_failed_to_list_tenants", error=str(exc))
+        await record_audit_best_effort("staging_cycle_failed", detail={"error": str(exc), "stage": "list_tenants"})
+        return
 
     for hub_id in hub_ids:
         try:
@@ -210,18 +229,13 @@ async def run_staging_cycle() -> None:
             await stage_tenant_pull(hub_id, pulled)
             await record_audit("staging_cycle_completed", hub_id=hub_id, detail={"tables": list(pulled.keys())})
         except Exception as exc:
+            # If record_audit_best_effort's own record_audit call fails for
+            # the same reason the pull did (a Postgres outage, most
+            # plausibly), letting that propagate would abort this for loop
+            # entirely — silently skipping every remaining tenant in this
+            # cycle, not just this one. record_audit_best_effort's shared
+            # try/except (see auth/security.py) is what keeps the cycle
+            # moving; the logger.error below already guarantees the
+            # original failure is visible regardless.
             logger.error("airtable_staging.cycle_failed", hub_id=hub_id, error=str(exc))
-            try:
-                await record_audit("staging_cycle_failed", hub_id=hub_id, detail={"error": str(exc)})
-            except Exception as audit_exc:
-                # If record_audit fails for the same reason the pull did (a
-                # Postgres outage, most plausibly), letting that propagate
-                # would abort this for loop entirely — silently skipping
-                # every remaining tenant in this cycle, not just this one.
-                # The logger.error above already guarantees this failure is
-                # visible; this guard just keeps the cycle moving.
-                logger.error(
-                    "airtable_staging.failure_audit_also_failed",
-                    hub_id=hub_id,
-                    error=str(audit_exc),
-                )
+            await record_audit_best_effort("staging_cycle_failed", hub_id=hub_id, detail={"error": str(exc)})

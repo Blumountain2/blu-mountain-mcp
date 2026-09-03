@@ -1,18 +1,20 @@
 """Unit tests for session/live_session.py's staff-identity extraction and
-query_hubspot_data's routing across sync/hubspot_client.py's three read
-paths. conftest.py's autouse _pool fixture opens a real Postgres connection
-for every test in this suite — there's no DB-independent test tier here."""
+the four category-scoped query_* tools' routing across
+sync/hubspot_client.py's three read paths (openspec/changes/separate-
+vertical-client-agents, task 6 — replacing the single generic
+query_hubspot_data). conftest.py's autouse _pool fixture opens a real
+Postgres connection for every test in this suite — there's no
+DB-independent test tier here."""
 
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastmcp import Client
 
 from db import get_pool
 from session import live_session
-from sync import hubspot_client
 from sync.hubspot_client import HubSpotDataPullClient
 
 
@@ -30,20 +32,47 @@ def _fake_token(email: str, hd: str = "blumountain.me", jti: str = "jti-1"):
     )
 
 
-class _FakeTool:
-    def __init__(self, name):
-        self.name = name
+def _resp(status_code: int, body: dict) -> httpx.Response:
+    request = httpx.Request("GET", "https://api.hubapi.com/fake")
+    return httpx.Response(status_code, json=body, request=request)
 
 
-class _FakeResult:
-    def __init__(self, data):
-        self.data = data
+def _page(results: list[dict]) -> httpx.Response:
+    return _resp(200, {"results": results, "paging": {}})
 
 
-class _FakeMCPClient:
-    def __init__(self, tools, responses):
-        self._tools = [_FakeTool(name) for name in tools]
-        self._responses = responses
+class _FakeAsyncClient:
+    """Same fake shape as tests/sync/test_hubspot_client.py's own: routes
+    GET/POST calls to per-path handler functions against api.hubapi.com,
+    since HubSpotDataPullClient is REST-based (openspec/changes/hubspot-
+    rest-api-pivot), not MCP-based, as of this rewrite."""
+
+    def __init__(self, get_handlers: dict | None = None, post_handlers: dict | None = None):
+        self._get_handlers = get_handlers or {}
+        self._post_handlers = post_handlers or {}
+        self.calls: list[tuple[str, str, dict, dict]] = []
+
+    def _path(self, url: str) -> str:
+        return url.replace("https://api.hubapi.com", "")
+
+    async def get(self, url, headers=None, params=None):
+        path = self._path(url)
+        self.calls.append(("GET", path, params or {}, headers or {}))
+        handler = self._get_handlers.get(path)
+        if handler is None:
+            raise AssertionError(f"no fake GET handler registered for {path}")
+        return handler(params or {})
+
+    async def post(self, url, headers=None, json=None):
+        path = self._path(url)
+        self.calls.append(("POST", path, json or {}, headers or {}))
+        handler = self._post_handlers.get(path)
+        if handler is None:
+            raise AssertionError(f"no fake POST handler registered for {path}")
+        return handler(json or {})
+
+    async def aclose(self):
+        pass
 
     async def __aenter__(self):
         return self
@@ -51,30 +80,17 @@ class _FakeMCPClient:
     async def __aexit__(self, *exc_info):
         return False
 
-    async def list_tools(self):
-        return self._tools
 
-    async def call_tool(self, name, params):
-        if name == "query_crm_data":
-            return _FakeResult(self._responses.get("query_crm_data", {"results": []}))
-        return _FakeResult(self._responses.get(name, {"id": f"{name}-1"}))
-
-
-async def _seed_single_tenant(hub_id: str, monkeypatch, tools, responses):
+async def _seed_single_tenant(hub_id: str, monkeypatch, get_handlers: dict | None = None, post_handlers: dict | None = None):
     pool = await get_pool()
     await pool.execute(
         "INSERT INTO tenants (hub_id, install_status) VALUES ($1, 'installed')", hub_id
     )
 
-    async def fake_client(self, access_token):
-        return _FakeMCPClient(tools, responses)
+    async def fake_client_for_hub(self):
+        return _FakeAsyncClient(get_handlers, post_handlers), {"Authorization": "Bearer access-token"}
 
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "access-token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
     monkeypatch.setattr(
         live_session, "get_access_token", lambda: _fake_token("staff@blumountain.me")
     )
@@ -335,7 +351,7 @@ async def test_select_tenant_ambiguous_candidates_never_include_a_restricted_ten
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_never_constructs_a_client_for_a_restricted_tenant(monkeypatch):
+async def test_query_users_never_constructs_a_client_for_a_restricted_tenant(monkeypatch):
     """Strengthens the "no data leakage" guarantee beyond "the right
     exception was raised somewhere upstream" (which every other isolation
     test proves): this asserts the actual HubSpot-pulling client is only
@@ -369,17 +385,14 @@ async def test_query_hubspot_data_never_constructs_a_client_for_a_restricted_ten
 
     monkeypatch.setattr(HubSpotDataPullClient, "__init__", _recording_init)
 
-    async def fake_client(self, access_token):
-        return _FakeMCPClient(["search_owners"], {"search_owners": {"owners": []}})
+    async def fake_client_for_hub(self):
+        return _FakeAsyncClient(get_handlers={"/crm/v3/owners/": lambda params: _page([])}), {
+            "Authorization": "Bearer access-token"
+        }
 
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
 
-    async def fake_get_access_token(hub_id):
-        return "access-token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    await live_session.query_hubspot_data("owners")
+    await live_session.query_users("owners")
 
     # The only tenant with only one permitted match auto-selects — the
     # HubSpot client was constructed exactly once, and only ever for the
@@ -391,122 +404,160 @@ async def test_query_hubspot_data_never_constructs_a_client_for_a_restricted_ten
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_returns_core_crm_objects(monkeypatch):
+async def test_query_crm_records_returns_core_crm_objects(monkeypatch):
     """Core CRM objects (contacts, deals, companies, etc.) have no
-    per-object tool — reachable only via query_crm_data — so this must not
-    silently return {} the way it did before this path was added."""
-    envelope = {
-        "results": [{"content": json.dumps({"id": "contact-1", "properties": {}})}]
-    }
+    dedicated generic capability — reachable only via
+    /crm/v3/objects/{slug} — so this must not silently return {} the way
+    it did before this path was added."""
     await _seed_single_tenant(
-        "hub_live_a", monkeypatch, ["query_crm_data"], {"query_crm_data": envelope}
+        "hub_live_a",
+        monkeypatch,
+        get_handlers={"/crm/v3/objects/contacts": lambda params: _page([{"id": "contact-1", "properties": {}}])},
     )
 
-    result = await live_session.query_hubspot_data("contacts")
+    result = await live_session.query_crm_records("contacts")
 
     assert "CONTACT" in result
     assert result["CONTACT"] == [{"id": "contact-1", "properties": {}}]
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_matches_irregular_plural_companies(monkeypatch):
+async def test_query_crm_records_matches_irregular_plural_companies(monkeypatch):
     """"companies" is not a substring of "COMPANY" and vice versa (the
     plural changes "y" to "ies") — a bare substring check misses this
     entirely, silently returning nothing for one of the objects staff
     would ask for most. CRM_OBJECT_ALIASES exists specifically to catch
     this and other irregular/compound names."""
-    envelope = {"results": [{"content": json.dumps({"id": "co-1", "properties": {}})}]}
     await _seed_single_tenant(
-        "hub_live_companies", monkeypatch, ["query_crm_data"], {"query_crm_data": envelope}
+        "hub_live_companies",
+        monkeypatch,
+        get_handlers={"/crm/v3/objects/companies": lambda params: _page([{"id": "co-1", "properties": {}}])},
     )
 
-    result = await live_session.query_hubspot_data("companies")
+    result = await live_session.query_crm_records("companies")
 
     assert result["COMPANY"] == [{"id": "co-1", "properties": {}}]
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_matches_compound_meeting_event(monkeypatch):
+async def test_query_crm_records_can_be_scoped_to_explicit_properties(monkeypatch):
+    """task 6.3: an explicit properties list is forwarded through to
+    pull_crm_objects, which is what lets a category tool be scoped to a
+    client's own confirmed-relevant or custom fields — confirmed live
+    (openspec/changes/hubspot-rest-api-pivot, task 2.3) this narrows the
+    REST response to exactly those properties, not additively."""
+    seen_params = {}
+
+    def contacts_handler(params):
+        seen_params["contacts"] = params
+        return _page([{"id": "contact-1", "properties": {}}])
+
+    await _seed_single_tenant(
+        "hub_live_props", monkeypatch, get_handlers={"/crm/v3/objects/contacts": contacts_handler}
+    )
+
+    await live_session.query_crm_records("contacts", properties=["email", "custom_lead_score"])
+
+    assert seen_params["contacts"]["properties"] == "email,custom_lead_score"
+
+
+@pytest.mark.asyncio
+async def test_query_crm_records_rejects_an_out_of_category_object_type(monkeypatch):
+    """task 6.1: a real object type that belongs to a different category
+    tool is rejected explicitly, not silently returned empty — "calls" is
+    an Engagement Record, not a CRM Record."""
+    await _seed_single_tenant("hub_live_wrong_cat", monkeypatch)
+
+    result = await live_session.query_crm_records("calls")
+
+    assert "error" in result
+    assert "CONTACT" not in result
+
+
+@pytest.mark.asyncio
+async def test_query_engagement_records_matches_compound_meeting_event(monkeypatch):
     """"meetings" has no substring relationship with "MEETING_EVENT" at
     all — a compound, underscored type name a plain plural-of-singular
     check can never catch."""
-    envelope = {"results": [{"content": json.dumps({"id": "m-1", "properties": {}})}]}
     await _seed_single_tenant(
-        "hub_live_meetings", monkeypatch, ["query_crm_data"], {"query_crm_data": envelope}
+        "hub_live_meetings",
+        monkeypatch,
+        get_handlers={"/crm/v3/objects/meetings": lambda params: _page([{"id": "m-1", "properties": {}}])},
     )
 
-    result = await live_session.query_hubspot_data("meetings")
+    result = await live_session.query_engagement_records("meetings")
 
     assert result["MEETING_EVENT"] == [{"id": "m-1", "properties": {}}]
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_matches_teams_via_organization_alias(monkeypatch):
+async def test_query_users_matches_teams_via_organization_alias(monkeypatch):
     """"teams" has no CRM_OBJECT_TYPES entry at all — its only real path
-    is get_organization_details, findable only by translating "teams" to
-    "organization" first, the same way hubspot_client.py's own
-    IN_SCOPE_OBJECT_KEYWORDS already does for the scheduled pull."""
+    is the organization_details capability, findable only by translating
+    "teams" to "organization" first, the same way hubspot_client.py's own
+    generic-capability categorization already does for the scheduled
+    pull."""
     await _seed_single_tenant(
         "hub_live_teams",
         monkeypatch,
-        ["get_organization_details"],
-        {"get_organization_details": {"teams": [{"id": "team-1"}]}},
+        get_handlers={
+            "/settings/v3/users/teams": lambda params: _resp(200, {"results": [{"id": "team-1"}]}),
+            "/settings/v3/users/": lambda params: _resp(200, {}),
+            "/account-info/v3/details": lambda params: _resp(200, {}),
+        },
     )
 
-    result = await live_session.query_hubspot_data("teams")
+    result = await live_session.query_users("teams")
 
-    assert result["get_organization_details"] == {"teams": [{"id": "team-1"}]}
+    assert result["organization_details"]["teams"] == {"results": [{"id": "team-1"}]}
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_handles_campaign_without_crashing(monkeypatch):
-    """read_campaign_data always needs a specific campaignCrmObjectId — a
-    bare call with none used to raise uncaught. Campaign queries must
-    route through pull_campaign_data()'s enumerate-then-call-per-campaign
-    handling instead."""
-    campaign_envelope = {
-        "results": [{"content": json.dumps({"properties": {"hs_object_id": "111"}})}]
-    }
+async def test_query_marketing_content_handles_campaign_without_crashing(monkeypatch):
+    """Every per-campaign metrics call needs a specific campaign GUID —
+    campaign queries must route through pull_campaign_data()'s
+    enumerate-then-call-per-campaign handling, not a bare call with no
+    ID."""
     await _seed_single_tenant(
         "hub_live_b",
         monkeypatch,
-        ["query_crm_data", "read_campaign_data"],
-        {"query_crm_data": campaign_envelope, "read_campaign_data": {"views": 10}},
+        get_handlers={
+            "/marketing/v3/campaigns": lambda params: _page([{"id": "111"}]),
+            "/marketing/v3/campaigns/111/reports/metrics": lambda params: _resp(200, {"views": 10}),
+        },
     )
 
-    result = await live_session.query_hubspot_data("campaign")
+    result = await live_session.query_marketing_content("campaign")
 
     assert result["campaign_data"] == [{"views": 10, "id": "111"}]
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_still_matches_generic_tools(monkeypatch):
-    """The original behavior (matching generic, dynamically-discovered
-    tools by substring) must still work for object types that aren't core
-    CRM objects or campaigns."""
+async def test_query_users_still_matches_generic_tools(monkeypatch):
+    """The original behavior (matching generic capabilities by substring)
+    must still work for object types that aren't core CRM objects or
+    campaigns."""
     await _seed_single_tenant(
-        "hub_live_c", monkeypatch, ["search_owners"], {"search_owners": {"owners": []}}
+        "hub_live_c", monkeypatch, get_handlers={"/crm/v3/owners/": lambda params: _page([])}
     )
 
-    result = await live_session.query_hubspot_data("owners")
+    result = await live_session.query_users("owners")
 
-    assert result["search_owners"] == {"owners": []}
+    assert result["owners"] == []
 
 
 @pytest.mark.asyncio
-async def test_query_hubspot_data_never_calls_read_campaign_data_bare(monkeypatch):
-    """read_campaign_data must be excluded from the generic-tool loop even
-    when it matches by substring — it's already handled via
-    pull_campaign_data() above, and calling it bare would fail (no
-    campaignCrmObjectId)."""
+async def test_query_crm_records_never_matches_a_generic_tool_from_another_category(monkeypatch):
+    """The "owners" capability belongs to the Users category tool only —
+    a CRM Records query for "owners" (no CRM_OBJECT_TYPES match either)
+    must come back empty, not reach across categories."""
     await _seed_single_tenant(
-        "hub_live_d", monkeypatch, ["read_campaign_data"], {"query_crm_data": {"results": []}}
+        "hub_live_cross_cat", monkeypatch, get_handlers={"/crm/v3/owners/": lambda params: _page([])}
     )
 
-    result = await live_session.query_hubspot_data("campaign")
+    result = await live_session.query_crm_records("owners")
 
-    assert "read_campaign_data" not in result
-    assert result["campaign_data"] == []
+    assert result == {}
 
 
 # Every test above calls live_session's plain async functions directly —
@@ -525,7 +576,7 @@ async def test_query_hubspot_data_never_calls_read_campaign_data_bare(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_real_transport_lists_all_three_tools_with_correct_schemas(monkeypatch):
+async def test_real_transport_lists_all_six_tools_with_correct_schemas(monkeypatch):
     """Catches a parameter-rename regression class of bug that every other
     test in this file cannot: those call Python functions directly by
     keyword, so a mismatch between the function's real parameter name and
@@ -543,7 +594,10 @@ async def test_real_transport_lists_all_three_tools_with_correct_schemas(monkeyp
     assert by_name == {
         "list_my_tenants": set(),
         "select_tenant": {"tenant"},
-        "query_hubspot_data": {"object_type"},
+        "query_crm_records": {"object_type", "properties"},
+        "query_engagement_records": {"object_type", "properties"},
+        "query_marketing_content": {"object_type", "properties"},
+        "query_users": {"object_type", "properties"},
     }
 
 
@@ -563,18 +617,46 @@ async def test_real_transport_list_my_tenants_and_select_tenant_round_trip(monke
 
 
 @pytest.mark.asyncio
-async def test_real_transport_query_hubspot_data_round_trip(monkeypatch):
+async def test_real_transport_query_users_round_trip(monkeypatch):
     await _seed_single_tenant(
         "hub_transport_b",
         monkeypatch,
-        ["search_owners"],
-        {"search_owners": {"owners": []}},
+        get_handlers={"/crm/v3/owners/": lambda params: _page([])},
     )
 
     async with Client(live_session.mcp) as client:
-        result = await client.call_tool("query_hubspot_data", {"object_type": "owners"})
+        result = await client.call_tool("query_users", {"object_type": "owners"})
 
-    assert result.data == {"search_owners": {"owners": []}}
+    assert result.data == {"owners": []}
+
+
+@pytest.mark.asyncio
+async def test_real_transport_query_crm_records_with_properties_round_trip(monkeypatch):
+    """A real call_tool round trip exercising the new `properties`
+    parameter specifically — confirms it's wired through real JSON-RPC
+    parameter binding, not just a direct Python keyword call."""
+    await _seed_single_tenant(
+        "hub_transport_props",
+        monkeypatch,
+        get_handlers={"/crm/v3/objects/contacts": lambda params: _page([{"id": "contact-1", "properties": {}}])},
+    )
+
+    async with Client(live_session.mcp) as client:
+        result = await client.call_tool(
+            "query_crm_records", {"object_type": "contacts", "properties": ["email"]}
+        )
+
+    assert result.data["CONTACT"] == [{"id": "contact-1", "properties": {}}]
+
+
+@pytest.mark.asyncio
+async def test_real_transport_query_engagement_records_rejects_out_of_category_type(monkeypatch):
+    await _seed_single_tenant("hub_transport_wrong_cat", monkeypatch)
+
+    async with Client(live_session.mcp) as client:
+        result = await client.call_tool("query_engagement_records", {"object_type": "contacts"})
+
+    assert "error" in result.data
 
 
 @pytest.mark.asyncio
@@ -598,7 +680,7 @@ async def test_real_transport_tenant_pipeline_overview_prompt_round_trip():
     text = result.messages[0].content.text
     assert "Acme" in text
     assert "select_tenant" in text
-    assert "query_hubspot_data" in text
+    assert "query_crm_records" in text
 
 
 @pytest.mark.asyncio

@@ -3,11 +3,11 @@ HubSpot MCP Server.
 
 Hosts, side by side:
 - HubSpot OAuth v3 + PKCE install/callback (Flow B) and the HubSpot
-  uninstall webhook (auth.hubspot_oauth, auth.token_vault).
-- A second, parallel OAuth v3 + PKCE install/callback for the MCP Auth App
-  (auth.mcp_auth, spec Section 4.1) — a separate credential from the Public
-  App above, since HubSpot's remote MCP endpoint (mcp.hubspot.com) does not
-  accept the Public App's CRM-scoped token.
+  uninstall webhook (auth.hubspot_oauth, auth.token_vault) — the single
+  install step. HubSpotDataPullClient now reads HubSpot's plain REST API
+  (api.hubapi.com) using this Public App token directly
+  (openspec/changes/hubspot-rest-api-pivot); a second install step is no
+  longer needed.
 - The scheduled Airtable staging cycle (sync.airtable_staging), driven by
   APScheduler on SYNC_INTERVAL_MINUTES.
 - A daily audit-log retention purge (auth.security.purge_expired_audit_log),
@@ -16,6 +16,9 @@ Hosts, side by side:
 - The live interactive session (session.live_session), FastMCP's OAuth Proxy
   wrapping Google Workspace, mounted at /mcp — reachable identically from
   Claude Desktop, Claude Code, or Claude Cowork.
+- A plain HTTP debug API (debug_api) for pulling a real installed tenant's
+  HubSpot data via Postman rather than the MCP protocol — gated shut by
+  default (DEBUG_API_KEY empty = every request 401s).
 
 Direct Google/Microsoft staff/owner authentication (session.staff_auth) is
 not wired in here. It's kept in the codebase, unhooked, in case a non-MCP
@@ -23,25 +26,26 @@ consumer (e.g. a future web dashboard) ends up needing it; see design.md's
 decision log in the implement-hubspot-mcp-server change for why.
 """
 
-import os
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 from urllib.parse import urlparse
 
 import structlog
+from apscheduler.events import EVENT_JOB_ERROR, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
 from auth import (
     hubspot_oauth_router,
-    mcp_auth_router,
     purge_expired_audit_log,
-    record_audit,
+    record_audit_best_effort,
     token_vault_router,
 )
 from config import settings
 from db import close_pool, get_pool, init_schema
+from debug_api import router as debug_api_router
 from session import mcp as live_mcp
 from sync import run_staging_cycle
 from webhooks import sybill_router
@@ -64,7 +68,48 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
+
+# Holds a strong reference to every in-flight _on_scheduled_job_error audit
+# task. asyncio only keeps a weak reference to a task with no other
+# referent — an unreferenced task can be garbage-collected mid-execution,
+# silently dropping the very audit write this listener exists to
+# guarantee (see https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
+# Each task removes itself once done via add_done_callback below.
+_pending_job_error_audits: set[asyncio.Task] = set()
+
+
+def _on_scheduled_job_error(event: JobExecutionEvent) -> None:
+    """Global safety net for every scheduled job, present and future: even
+    an exception a job's own code never reaches its own try/except for
+    (e.g. a bug in setup code before that job's first `try:` — confirmed
+    live as a real gap in run_staging_cycle's tenant-listing step before
+    this listener existed) still gets logged and recorded here, rather
+    than only reaching APScheduler's own internal logger where it'd be
+    invisible to anyone not specifically watching scheduler-internal logs.
+    Every job added to `scheduler` gets this guarantee automatically —
+    nobody adding a new job later has to remember to hand-wrap it
+    correctly for this baseline to hold.
+
+    APScheduler invokes listeners synchronously even under
+    AsyncIOScheduler, so the audit write (async) is scheduled onto the
+    already-running loop via create_task rather than awaited directly
+    here. Uses record_audit_best_effort, not record_audit: if the audit
+    write itself fails too (e.g. the same DB outage that caused the
+    original job failure), that failure is logged through this project's
+    own structured logger instead of surfacing only via asyncio's default
+    "Task exception was never retrieved" handler."""
+    logger.error("scheduler.job_failed", job_id=event.job_id, error=str(event.exception))
+    task = asyncio.create_task(
+        record_audit_best_effort(
+            "scheduled_job_failed", detail={"job_id": event.job_id, "error": str(event.exception)}
+        )
+    )
+    _pending_job_error_audits.add(task)
+    task.add_done_callback(_pending_job_error_audits.discard)
+
+
 scheduler = AsyncIOScheduler()
+scheduler.add_listener(_on_scheduled_job_error, EVENT_JOB_ERROR)
 mcp_app = live_mcp.http_app(path="/", transport="streamable-http")
 
 # Single source of truth for where the live session is mounted, derived from
@@ -89,16 +134,15 @@ async def _run_audit_log_purge() -> None:
     guarded: it hits the same Postgres pool the purge itself just failed
     against, so if the real cause is a DB outage, that call would raise too
     — the plain logger.error above is what still gets through in that case,
-    since it doesn't depend on Postgres at all."""
+    since it doesn't depend on Postgres at all. The fallback-audit guard
+    itself is shared (auth.record_audit_best_effort) with
+    sync/airtable_staging.py's own near-identical failure paths."""
     try:
         deleted = await purge_expired_audit_log()
         logger.info("audit_log_purge.completed", rows_deleted=deleted)
     except Exception as exc:
         logger.error("audit_log_purge.failed", error=str(exc))
-        try:
-            await record_audit("audit_log_purge_failed", detail={"error": str(exc)})
-        except Exception as audit_exc:
-            logger.error("audit_log_purge.failure_audit_also_failed", error=str(audit_exc))
+        await record_audit_best_effort("audit_log_purge_failed", detail={"error": str(exc)})
 
 
 @asynccontextmanager
@@ -139,9 +183,9 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="HubSpot MCP Server", version="0.2.0", lifespan=lifespan)
 
 app.include_router(hubspot_oauth_router)
-app.include_router(mcp_auth_router)
 app.include_router(token_vault_router)
 app.include_router(sybill_router)
+app.include_router(debug_api_router)
 app.mount(_MCP_MOUNT_PATH, mcp_app)
 
 
@@ -203,25 +247,10 @@ async def root() -> Dict[str, Any]:
         "status": "running",
         "active_paths": [
             "hubspot-oauth",
-            "mcp-auth",
             "token-vault",
             "airtable-staging",
             "sybill-ingestion",
             "live-mcp-session",
+            "debug-hubspot-api",
         ],
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", 8888))
-    log_level = os.getenv("LOG_LEVEL", "info").lower()
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        log_level=log_level,
-        reload=os.getenv("GATEWAY_MODE") == "development",
-    )

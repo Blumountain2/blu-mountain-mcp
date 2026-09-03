@@ -1,0 +1,926 @@
+{
+  "info": {
+    "name": "Blu Mountain HubSpot MCP Server",
+    "_postman_id": "b4f1a1a0-6b1e-4b1a-9c1a-6f3a1e6f1a01",
+    "description": "This service's own exposed HTTP endpoints (not HubSpot's API directly) \u2014 /install, /callback, /health, /, the two webhook receivers, and the API-key-gated debug HubSpot data API (gateway/debug_api.py). Excludes /install/mcp-auth and /callback/mcp-auth (removed in the REST pivot, openspec/changes/hubspot-rest-api-pivot) and the /mcp mount (MCP protocol over Streamable HTTP, not a plain REST endpoint Postman represents naturally \u2014 use MCP Inspector instead, see CLAUDE.md's Development commands).\n\nUses the {{base_url}} collection variable, defaulting to http://localhost:8888 (docker compose up's dev stack). The two webhook requests carry a pre-request script that computes a real, valid signature from a collection variable holding the relevant secret, so they run against a live server exactly as HubSpot/Sybill would call them \u2014 not just a URL list.\n\nTo actually pull real HubSpot data: set {{debug_api_key}} to match the server's own DEBUG_API_KEY, run 'List installed tenants' (its test script auto-fills {{hub_id}} from the first result), then run any of the requests under 'Debug: HubSpot Data' \u2014 they all use {{hub_id}}.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8888",
+      "description": "The running mcp-gateway service. docker compose up's dev stack serves this on :8888 by default."
+    },
+    {
+      "key": "portal_name",
+      "value": "Example Client",
+      "description": "Optional human-readable name for /install's ?portal_name= param. HubSpot has no API for this \u2014 whoever sends the install link supplies it."
+    },
+    {
+      "key": "sybill_webhook_secret",
+      "value": "whsec_dGVzdC1zZWNyZXQta2V5LWZvci10ZXN0cw==",
+      "description": "Must match SYBILL_WEBHOOK in the server's own .env for the pre-request script's computed signature to verify. The whsec_ prefix is optional \u2014 verify_svix_signature strips it either way. Replace with the real value to test against a real deployment; this default matches the test suite's own dummy secret, not a real Sybill secret."
+    },
+    {
+      "key": "hubspot_app_client_secret",
+      "value": "test-app-client-secret",
+      "description": "Must match HUBSPOT_APP_CLIENT_SECRET in the server's own .env for the uninstall webhook's computed signature to verify. Replace with the real value to test against a real deployment."
+    },
+    {
+      "key": "test_hub_id",
+      "value": "148997330",
+      "description": "A hub_id already present in the tenants table (from a completed /install) \u2014 the uninstall webhook example targets this one. Change to whichever real or test tenant you want to exercise."
+    },
+    {
+      "key": "debug_api_key",
+      "value": "",
+      "description": "Must match the running server's own DEBUG_API_KEY (see .env.example). Every /debug/hubspot/* request 401s without this \u2014 empty by default so a fresh import can't accidentally reach real tenant data with no setup."
+    },
+    {
+      "key": "hub_id",
+      "value": "",
+      "description": "Which installed tenant the Debug: HubSpot Data requests pull from. Run 'List installed tenants' first \u2014 its test script fills this in automatically from the first tenant returned \u2014 or set it by hand to a specific hub_id."
+    },
+    {
+      "key": "custom_object_type_id",
+      "value": "",
+      "description": "Which custom object 'Pull a custom object's records' reads. Run 'List custom object schemas' first \u2014 its test script fills this in automatically from the first schema returned \u2014 or set it by hand to a real objectTypeId (e.g. 2-3465404)."
+    }
+  ],
+  "item": [
+    {
+      "name": "Health & status",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Reflects real service state: Postgres connectivity and scheduler status. Returns {\"status\": \"healthy\"|\"degraded\", \"postgres\": \"connected\"|\"unreachable\", \"scheduler\": \"running\"|\"stopped\"}."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('reports a status field', () => pm.expect(pm.response.json()).to.have.property('status'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET / (root)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                ""
+              ]
+            },
+            "description": "Lists this service's active route groups (active_paths) \u2014 a quick sanity check that expected subsystems are mounted (hubspot-oauth, token-vault, airtable-staging, sybill-ingestion, live-mcp-session). Should NOT list mcp-auth \u2014 that was removed in the REST pivot."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('mcp-auth is gone', () => pm.expect(pm.response.json().active_paths).to.not.include('mcp-auth'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HubSpot Public App OAuth (Flow B)",
+      "item": [
+        {
+          "name": "GET /install",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/install?portal_name={{portal_name}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "install"
+              ],
+              "query": [
+                {
+                  "key": "portal_name",
+                  "value": "{{portal_name}}"
+                }
+              ]
+            },
+            "description": "Starts the OAuth v3 + PKCE install flow: redirects (307) to HubSpot's own authorization screen, listing every scope in HUBSPOT_SCOPES (required) plus whichever of HUBSPOT_OPTIONAL_SCOPES the connecting portal's tier supports. This is the single onboarding step \u2014 the MCP Auth App's second install step no longer exists.\n\nPostman follows redirects by default; to inspect the raw 307 and its Location header (the actual HubSpot authorize URL, useful for confirming exactly which scopes are being requested under scope= vs optional_scope=), turn off 'Automatically follow redirects' in this request's Settings tab, or in the collection's global settings."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('redirects toward HubSpot (or 200 if redirects were followed)', () => {",
+                  "  pm.expect([200, 302, 307]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /callback (error path \u2014 missing params)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/callback",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "callback"
+              ]
+            },
+            "description": "In real use, HubSpot itself redirects a portal admin's browser here with ?code=...&state=... after they approve the install \u2014 this endpoint isn't meaningfully callable standalone from Postman with a fabricated code/state (the state must match a real oauth_states row created by a real /install call in the same browser session, and the code must be a real HubSpot-issued authorization code). Calling it bare, as this request does, exercises the 'missing required information' error path (400) and its styled HTML error page \u2014 a genuine, useful smoke test in its own right."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('400 on missing code/state', () => pm.response.to.have.status(400));",
+                  "pm.test('renders the styled HTML error page, not raw JSON', () => {",
+                  "  pm.expect(pm.response.headers.get('Content-Type')).to.include('text/html');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Webhooks",
+      "item": [
+        {
+          "name": "POST /webhooks/sybill",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"eventId\": \"evt_postman_example\",\n  \"eventType\": \"meeting.new_recording.v2\",\n  \"objectId\": \"meeting_postman_example\",\n  \"data\": {\n    \"crm\": {\n      \"id\": \"REPLACE_WITH_A_REAL_INDEXED_OBJECT_ID\",\n      \"type\": \"deal\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/webhooks/sybill",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "sybill"
+              ]
+            },
+            "description": "Sybill call-transcript webhook, Svix-signed (svix-id/svix-timestamp/svix-signature headers, HMAC-SHA256). This request's pre-request script computes a real, valid signature from {{sybill_webhook_secret}} \u2014 no manual header-crafting needed, but the secret variable must match the server's own SYBILL_WEBHOOK for it to verify.\n\nTenant resolution reads data.crm.{id,type} against hubspot_object_index (populated by real staged Company/Deal pulls) \u2014 replace REPLACE_WITH_A_REAL_INDEXED_OBJECT_ID with a real hs_object_id already staged for a connected tenant, or this returns 422 (tenant not resolvable), which is itself a valid, informative response confirming signature verification passed but no matching tenant exists. crm.type accepts 'deal'/'opportunity' or 'company'/'account' (Sybill uses Salesforce-flavored terms; HubSpot's own terms are also accepted)."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Computes a real Svix signature (svix-id.svix-timestamp.body, HMAC-SHA256,",
+                  "// base64) matching gateway/webhooks/sybill.py::verify_svix_signature exactly,",
+                  "// so this request verifies against a real running server with no manual",
+                  "// header-crafting \u2014 only {{sybill_webhook_secret}} needs to match the",
+                  "// server's own SYBILL_WEBHOOK.",
+                  "const secret = pm.variables.get('sybill_webhook_secret');",
+                  "const rawSecret = secret.startsWith('whsec_') ? secret.slice(6) : secret;",
+                  "",
+                  "// Mirrors the server's own try/except exactly: base64-decode only if it's",
+                  "// actually valid base64 (standard alphabet, correct padding length) \u2014",
+                  "// Python's base64.b64decode raises on this project's real SYBILL_WEBHOOK",
+                  "// value (it contains '_' and has a non-multiple-of-4 length), so the server",
+                  "// falls back to using the raw secret string's UTF-8 bytes as the HMAC key.",
+                  "// A JS base64 parser that silently tolerates invalid input would compute a",
+                  "// different (wrong) key here for that exact real-world case.",
+                  "const looksLikeBase64 = /^[A-Za-z0-9+/]*={0,2}$/.test(rawSecret) && rawSecret.length % 4 === 0;",
+                  "const secretWordArray = looksLikeBase64 ? CryptoJS.enc.Base64.parse(rawSecret) : CryptoJS.enc.Utf8.parse(rawSecret);",
+                  "",
+                  "const svixId = 'msg_postman_' + Date.now();",
+                  "const svixTimestamp = Math.floor(Date.now() / 1000).toString();",
+                  "// pm.request.body.raw is the unresolved template at pre-request time \u2014",
+                  "// {{variables}} are only substituted afterward, just before the request is",
+                  "// actually sent. Must resolve them here too, or the signature is computed",
+                  "// over different bytes than what the server actually receives.",
+                  "const body = pm.variables.replaceIn(pm.request.body.raw);",
+                  "",
+                  "const signedContent = `${svixId}.${svixTimestamp}.${body}`;",
+                  "const signatureB64 = CryptoJS.HmacSHA256(signedContent, secretWordArray).toString(CryptoJS.enc.Base64);",
+                  "",
+                  "pm.request.headers.upsert({ key: 'svix-id', value: svixId });",
+                  "pm.request.headers.upsert({ key: 'svix-timestamp', value: svixTimestamp });",
+                  "pm.request.headers.upsert({ key: 'svix-signature', value: `v1,${signatureB64}` });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('signature verified, not 401', () => pm.expect(pm.response.code).to.not.equal(401));",
+                  "pm.test('either staged (200) or a resolvable-but-unmatched tenant (422)', () => {",
+                  "  pm.expect([200, 422]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /webhooks/hubspot/uninstall",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portalId\": \"{{test_hub_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/webhooks/hubspot/uninstall",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "hubspot",
+                "uninstall"
+              ]
+            },
+            "description": "HubSpot's app-lifecycle uninstall webhook (X-HubSpot-Signature-V3 + X-HubSpot-Request-Timestamp headers, plain HMAC-SHA256 hex digest of the raw body). This request's pre-request script computes a real, valid signature from {{hubspot_app_client_secret}} \u2014 must match the server's own HUBSPOT_APP_CLIENT_SECRET to verify.\n\nCAUTION: a real, valid call against a real portalId genuinely invalidates that tenant's vaulted token and marks it uninstalled (auth/token_vault.py::hubspot_uninstall_webhook) \u2014 this is a real, not read-only, action against whichever {{test_hub_id}} you point it at. Use a disposable test tenant, not a real client's hub_id, unless you specifically intend to uninstall it."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Computes the real HMAC-SHA256 hex signature matching",
+                  "// gateway/auth/token_vault.py::verify_hubspot_webhook_signature exactly \u2014",
+                  "// plain HMAC of the raw body with the client secret as key, no signed-content",
+                  "// concatenation the way Sybill's Svix scheme uses.",
+                  "const secret = pm.variables.get('hubspot_app_client_secret');",
+                  "// pm.request.body.raw is the unresolved template at pre-request time \u2014",
+                  "// {{test_hub_id}} is only substituted afterward, just before the request is",
+                  "// actually sent. Must resolve it here too, or the signature is computed",
+                  "// over different bytes than what the server actually receives.",
+                  "const body = pm.variables.replaceIn(pm.request.body.raw);",
+                  "",
+                  "const signatureHex = CryptoJS.HmacSHA256(body, secret).toString(CryptoJS.enc.Hex);",
+                  "",
+                  "pm.request.headers.upsert({ key: 'X-HubSpot-Signature-V3', value: signatureHex });",
+                  "pm.request.headers.upsert({ key: 'X-HubSpot-Request-Timestamp', value: Date.now().toString() });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('signature verified, not 401', () => pm.expect(pm.response.code).to.not.equal(401));",
+                  "pm.test('200 OK (tenant invalidated) or 400 (missing portal identifier)', () => {",
+                  "  pm.expect([200, 400]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Debug: HubSpot Data (test accounts)",
+      "description": "gateway/debug_api.py \u2014 a plain HTTP surface for pulling a real installed tenant's HubSpot data directly, since the /mcp mount is MCP protocol, not something Postman can call naturally. Gated by {{debug_api_key}} (X-Debug-Api-Key header) \u2014 every request 401s if it's unset or wrong, matching the server's own DEBUG_API_KEY. Every successful pull is recorded in this project's own audit_log, same as any other HubSpot access path. Read-only, same guarantee as every other path in this project.\n\nWorkflow: run 'List installed tenants' first (fills {{hub_id}} automatically from the first result), then run any request below.",
+      "item": [
+        {
+          "name": "List installed tenants",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/tenants",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "tenants"
+              ]
+            },
+            "description": "Every currently-installed tenant, with its display name. Run this first \u2014 its test script below fills {{hub_id}} in automatically from the first tenant returned, so every other request in this folder is ready to run immediately after."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const tenants = pm.response.json();",
+                  "if (Array.isArray(tenants) && tenants.length > 0) {",
+                  "    pm.collectionVariables.set('hub_id', tenants[0].hub_id);",
+                  "    console.log(`hub_id set to ${tenants[0].hub_id} (${tenants[0].name})`);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List object types & capabilities",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/object-types",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "object-types"
+              ]
+            },
+            "description": "The fixed set of valid {object_type} and {capability_name} path segments the requests below accept \u2014 useful reference, not tenant-specific."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull contacts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/contacts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "contacts"
+              ]
+            },
+            "description": "Real contacts for {{hub_id}} via GET /crm/v3/objects/contacts. Add ?properties=email,jobtitle to narrow the response to exact HubSpot property names instead of the default set (REST's properties= is exclusive, not additive)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull companies",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/companies",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "companies"
+              ]
+            },
+            "description": "Real companies for {{hub_id}} via GET /crm/v3/objects/companies."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull deals",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/deals",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "deals"
+              ]
+            },
+            "description": "Real deals for {{hub_id}} via GET /crm/v3/objects/deals."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull line items",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/line_items",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "line_items"
+              ]
+            },
+            "description": "Real line items (LINE_ITEM) for {{hub_id}} via GET /crm/v3/objects/line_items."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull products",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/products",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "products"
+              ]
+            },
+            "description": "Real products (PRODUCT) for {{hub_id}} via GET /crm/v3/objects/products."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull users",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/users",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "users"
+              ]
+            },
+            "description": "Real CRM users (USER) for {{hub_id}} via GET /crm/v3/objects/users."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull quotes",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/quotes",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "quotes"
+              ]
+            },
+            "description": "Real quotes (QUOTE) for {{hub_id}} via GET /crm/v3/objects/quotes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull emails",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/emails",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "emails"
+              ]
+            },
+            "description": "Real email engagements (EMAIL) for {{hub_id}} via GET /crm/v3/objects/emails."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull any CRM object type",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/crm/tickets",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "crm",
+                "tickets"
+              ]
+            },
+            "description": "Change the last path segment to any CRM object type or alias this project supports (tickets, line_items, products, calls, emails, meetings, notes, tasks, users, campaign, landing_pages, blog_posts, lists \u2014 see 'List object types & capabilities'). Aliases like plurals/irregular forms are accepted (e.g. 'companies', 'meetings')."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK or a clear 400 for a bad type', () => pm.expect([200, 400]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Discover properties (incl. custom fields)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/properties/contacts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "properties",
+                "contacts"
+              ]
+            },
+            "description": "Every real property HubSpot has for this object type on this tenant's portal, including custom ones, with HubSpot's own authoritative hubspotDefined flag (true = standard, false = custom). Change the last path segment to any CRM object type/alias."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull a generic capability (owners)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/capability/owners",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "capability",
+                "owners"
+              ]
+            },
+            "description": "Change the last path segment to any capability from 'List object types & capabilities' (owners, organization_details, content_analytics, marketing_email_analytics, campaign_attribution)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List custom object schemas",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/custom-objects",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "custom-objects"
+              ]
+            },
+            "description": "Every custom object schema defined on {{hub_id}}'s real portal, discovered fresh (openspec/changes/custom-object-support) \u2014 there's no fixed list of these the way there is for standard object types. Returns an empty list (not an error) on a portal without Custom Objects access, an Enterprise-tier HubSpot feature. Run this first \u2014 its test script fills {{custom_object_type_id}} in automatically from the first schema returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const schemas = pm.response.json().custom_object_schemas;",
+                  "if (Array.isArray(schemas) && schemas.length > 0) {",
+                  "    pm.collectionVariables.set('custom_object_type_id', schemas[0].objectTypeId);",
+                  "    console.log(`custom_object_type_id set to ${schemas[0].objectTypeId} (${schemas[0].name})`);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull a custom object's records",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/custom-objects/{{custom_object_type_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "custom-objects",
+                "{{custom_object_type_id}}"
+              ]
+            },
+            "description": "Real records for one custom object, by its objectTypeId \u2014 run 'List custom object schemas' first to populate {{custom_object_type_id}}. Add ?properties=field1,field2 to narrow the response, same as the standard-object pull requests above."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pull campaign metrics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Debug-Api-Key",
+                "value": "{{debug_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/debug/hubspot/{{hub_id}}/campaigns",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "debug",
+                "hubspot",
+                "{{hub_id}}",
+                "campaigns"
+              ]
+            },
+            "description": "Per-campaign attribution metrics for {{hub_id}} \u2014 enumerates real campaigns, then pulls each one's metrics. Returns an empty list (not an error) on a portal without Marketing Hub Professional+, since marketing.campaigns.read is an optional OAuth scope for exactly that reason."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

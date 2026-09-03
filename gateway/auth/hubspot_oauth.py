@@ -31,7 +31,10 @@ AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
 TOKEN_URL = "https://api.hubapi.com/oauth/v3/token"
 ACCESS_TOKEN_INFO_URL = "https://api.hubapi.com/oauth/v1/access-tokens/{token}"
 
-_STATE_TTL = timedelta(minutes=10)
+
+def state_ttl() -> timedelta:
+    """In-flight PKCE state validity window for /install -> /callback."""
+    return timedelta(minutes=settings.oauth_state_ttl_minutes)
 
 
 class HubSpotOAuthError(Exception):
@@ -75,6 +78,48 @@ def _parse_token_error(response: httpx.Response) -> HubSpotOAuthError:
     return HubSpotOAuthError(error, description)
 
 
+# Three response shapes /callback's own error paths need, differing only
+# in the retry path/label and which logger event name identifies which
+# failure occurred.
+
+
+def missing_code_or_state_response(request: Request, retry_path: str) -> HTMLResponse:
+    return error_page(
+        "Something Went Wrong",
+        "This link is missing required information. Please start the "
+        "connection process again.",
+        400,
+        request=request,
+        retry_path=retry_path,
+    )
+
+
+def expired_state_response(log_event: str, request: Request, retry_path: str) -> HTMLResponse:
+    logger.warning(log_event)
+    return error_page(
+        "Link Expired",
+        "This connection link has expired or was already used. Please "
+        "start again.",
+        403,
+        request=request,
+        retry_path=retry_path,
+    )
+
+
+def exchange_failed_response(
+    log_event: str, exc: HubSpotOAuthError, request: Request, retry_path: str
+) -> HTMLResponse:
+    logger.warning(log_event, error=exc.error)
+    return error_page(
+        "Connection Failed",
+        f"HubSpot reported an error completing this connection: {exc.error}. "
+        "Please try again or contact support if this continues.",
+        400,
+        request=request,
+        retry_path=retry_path,
+    )
+
+
 @router.get("/install")
 async def install(portal_name: str | None = None) -> RedirectResponse:
     """Starts Flow B: redirects the client portal admin to HubSpot's authorization URL.
@@ -112,6 +157,12 @@ async def install(portal_name: str | None = None) -> RedirectResponse:
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
     }
+    if settings.hubspot_optional_scopes:
+        # A separate query param from `scope`, confirmed against HubSpot's
+        # own OAuth docs: a scope missing here is just dropped from the
+        # grant, it doesn't fail the whole authorization the way a missing
+        # `scope` entry does — see config.py's hubspot_optional_scopes.
+        params["optional_scope"] = settings.hubspot_optional_scopes
     query = httpx.QueryParams(params)
     return RedirectResponse(f"{AUTHORIZE_URL}?{query}")
 
@@ -123,32 +174,17 @@ async def callback(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
 
     if not code or not state:
-        return error_page(
-            "Something Went Wrong",
-            "This link is missing required information. Please start the "
-            "connection process again.",
-            400,
-            request=request,
-            retry_path="/install",
-        )
+        return missing_code_or_state_response(request, retry_path="/install")
 
     pool = await get_pool()
     row = await pool.fetchrow(
         "DELETE FROM oauth_states WHERE state = $1 AND created_at > now() - $2::interval "
         "RETURNING code_verifier, portal_name",
         state,
-        _STATE_TTL,
+        state_ttl(),
     )
     if row is None:
-        logger.warning("hubspot_oauth.state_mismatch")
-        return error_page(
-            "Link Expired",
-            "This connection link has expired or was already used. Please "
-            "start again.",
-            403,
-            request=request,
-            retry_path="/install",
-        )
+        return expired_state_response("hubspot_oauth.state_mismatch", request, retry_path="/install")
 
     code_verifier = row["code_verifier"]
     portal_name = row["portal_name"]
@@ -156,15 +192,7 @@ async def callback(request: Request) -> HTMLResponse:
     try:
         result = await exchange_code(code, code_verifier)
     except HubSpotOAuthError as exc:
-        logger.warning("hubspot_oauth.token_exchange_failed", error=exc.error)
-        return error_page(
-            "Connection Failed",
-            f"HubSpot reported an error completing this connection: {exc.error}. "
-            "Please try again or contact support if this continues.",
-            400,
-            request=request,
-            retry_path="/install",
-        )
+        return exchange_failed_response("hubspot_oauth.token_exchange_failed", exc, request, retry_path="/install")
 
     await _persist_new_tenant(result, portal_name)
 
@@ -174,12 +202,9 @@ async def callback(request: Request) -> HTMLResponse:
     return install_success_page(
         "HubSpot Connected",
         result.hub_id,
-        "This HubSpot portal is now connected. One more step is needed to finish "
-        "setup: installing the MCP Auth App, which grants read access to this "
-        "portal's data.",
+        "This HubSpot portal is now connected. No further setup is needed — "
+        "this single install grants read access to this portal's data.",
         request=request,
-        next_path="/install/mcp-auth",
-        next_label="Continue setup",
     )
 
 

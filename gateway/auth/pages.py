@@ -117,6 +117,26 @@ _ERROR_ICON = (
 )
 
 
+def _render_page(title: str, icon_class: str, icon_svg: str, body_html: str, status_code: int = 200) -> HTMLResponse:
+    """Shared outer HTML shell for both page functions below — the entire
+    <!doctype html>...</html> structure was previously duplicated
+    verbatim in each, differing only in the icon and the card's body
+    content. `title` is escaped here since both callers pass it through
+    unescaped."""
+    page = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>{html.escape(title)}</title><style>{_STYLE}</style></head>
+<body>
+<div class="card">
+<div class="icon {icon_class}">{icon_svg}</div>
+<h1>{html.escape(title)}</h1>
+{body_html}
+</div>
+</body>
+</html>"""
+    return HTMLResponse(page, status_code=status_code)
+
+
 def install_success_page(
     title: str,
     hub_id: str,
@@ -144,20 +164,12 @@ def install_success_page(
     else:
         next_html = '<p class="close-note">You can close this window.</p>'
 
-    page = f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>{html.escape(title)}</title><style>{_STYLE}</style></head>
-<body>
-<div class="card">
-<div class="icon success">{_CHECK_ICON}</div>
-<h1>{html.escape(title)}</h1>
-<p class="message">{html.escape(message)}</p>
-<div class="portal-id">Portal ID: {html.escape(hub_id)}</div>
-{next_html}
-</div>
-</body>
-</html>"""
-    return HTMLResponse(page)
+    body_html = (
+        f'<p class="message">{html.escape(message)}</p>'
+        f'<div class="portal-id">Portal ID: {html.escape(hub_id)}</div>'
+        f"{next_html}"
+    )
+    return _render_page(title, "success", _CHECK_ICON, body_html)
 
 
 def error_page(
@@ -185,16 +197,5 @@ def error_page(
     else:
         retry_html = '<p class="close-note">Close this window and try again.</p>'
 
-    page = f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>{html.escape(title)}</title><style>{_STYLE}</style></head>
-<body>
-<div class="card">
-<div class="icon error">{_ERROR_ICON}</div>
-<h1>{html.escape(title)}</h1>
-<p class="message">{html.escape(message)}</p>
-{retry_html}
-</div>
-</body>
-</html>"""
-    return HTMLResponse(page, status_code=status_code)
+    body_html = f'<p class="message">{html.escape(message)}</p>{retry_html}'
+    return _render_page(title, "error", _ERROR_ICON, body_html, status_code=status_code)

@@ -76,6 +76,31 @@ async def test_install_stores_state_and_redirects():
 
 
 @pytest.mark.asyncio
+async def test_install_omits_optional_scope_param_when_not_configured():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/install", follow_redirects=False)
+
+    assert "optional_scope=" not in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_install_includes_optional_scope_param_when_configured(monkeypatch):
+    """Confirmed live (openspec/changes/hubspot-rest-api-pivot): requesting
+    marketing.campaigns.read as a required `scope` hard-failed a real
+    install on an account without Marketing Hub Professional+ ("your
+    account lacks access to the required scopes"). HubSpot's separate
+    `optional_scope` param is what degrades gracefully instead — a scope
+    listed there is just omitted from the grant if the account can't have
+    it, rather than failing the whole authorization."""
+    monkeypatch.setattr(hubspot_oauth.settings, "hubspot_optional_scopes", "marketing.campaigns.read")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/install", follow_redirects=False)
+
+    assert "optional_scope=marketing.campaigns.read" in response.headers["location"]
+
+
+@pytest.mark.asyncio
 async def test_install_with_portal_name_stores_it():
     # HubSpot has no API for a portal's human-readable name (confirmed
     # against its account-info endpoint and community docs) — whoever sends
@@ -203,7 +228,9 @@ async def test_callback_accepts_valid_state_and_persists_tenant(monkeypatch):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "12345" in response.text
-    assert "/install/mcp-auth" in response.text
+    # Single-install flow (openspec/changes/hubspot-rest-api-pivot): no
+    # "continue setup" link to a second install step anymore.
+    assert "/install/mcp-auth" not in response.text
 
     tenant_row = await pool.fetchrow("SELECT * FROM tenants WHERE hub_id = $1", "12345")
     assert tenant_row is not None

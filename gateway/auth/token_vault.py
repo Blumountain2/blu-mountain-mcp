@@ -16,7 +16,7 @@ from db import get_pool
 
 from .crypto import decrypt, derive_tenant_key, encrypt
 from .hubspot_oauth import refresh_token_pair
-from .security import record_audit
+from .security import record_audit_best_effort
 
 logger = structlog.get_logger()
 
@@ -130,45 +130,36 @@ _TOKEN_TABLE_CONFIG = {
         "invalidate_event": "token_invalidated",
         "mark_tenant_uninstalled_on_invalidate": True,
     },
-    "mcp_tokens": {
-        "refresh_event": "mcp_token_refreshed",
-        "invalidate_event": "mcp_token_invalidated",
-        "mark_tenant_uninstalled_on_invalidate": False,
-    },
 }
 
 PUBLIC_APP_TOKEN_TABLE = "tokens"
 
 
 async def acquire_tenant_lock(conn, hub_id: str, table_name: str = PUBLIC_APP_TOKEN_TABLE) -> None:
-    """Acquires the same per-tenant, per-table advisory lock TokenVault
-    itself uses below, scoped to conn's current transaction (released
-    automatically at transaction end). Exposed so a cross-cutting mutation
-    outside TokenVault (mcp_auth.py's install-order check, which reads
-    tenants.install_status — a fact only vault.invalidate() mutates) can
-    serialize against that vault's operations for the same hub_id instead
-    of racing it. Table-scoped, not just hub_id-scoped, so vault and
-    mcp_vault never needlessly block each other's refresh/invalidate for
-    the same tenant — they're independent tables with no data dependency
-    between them. Validated against the same _TOKEN_TABLE_CONFIG TokenVault
-    itself validates against — a typo'd or unrecognized table_name here
-    would otherwise silently lock a different key than TokenVault's own
-    calls use for that table, defeating the serialization a caller (e.g.
-    mcp_auth.py's install-order check) relies on this to provide."""
+    """Acquires the same per-tenant, per-table advisory lock TokenVault's
+    own get_access_token()/invalidate_in_transaction() use below, scoped
+    to conn's current transaction (released automatically at transaction
+    end). Validated against the same _TOKEN_TABLE_CONFIG TokenVault itself
+    validates against — a typo'd or unrecognized table_name here would
+    otherwise silently lock a different key than TokenVault's own calls
+    use for that table."""
     if table_name not in _TOKEN_TABLE_CONFIG:
         raise ValueError(f"Unrecognized token table: {table_name}")
     await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))", hub_id, table_name)
 
 
 class TokenVault:
-    """Parameterized by table_name/refresh_fn so a second instance (the MCP
-    Auth App's mcp_tokens, see mcp_auth.py) can reuse this exact
-    advisory-lock + cache + proactive-refresh logic without duplicating it —
-    the two credentials have an identical lifecycle, just against different
-    tables and different HubSpot token endpoints. table_name is restricted
-    to _TOKEN_TABLE_CONFIG's keys since it's interpolated directly into SQL
-    (no placeholder syntax exists for identifiers); this is safe only because
-    it's fixed at construction time by our own code, never external input."""
+    """Parameterized by table_name/refresh_fn — originally so a second
+    instance (the MCP Auth App's mcp_tokens, see design.md's decision log
+    for the hubspot-rest-api-pivot change) could reuse this exact
+    advisory-lock + cache + proactive-refresh logic against a second
+    credential; that second instance (mcp_vault) was removed once the REST
+    pivot made it unnecessary, but the parameterization itself stays —
+    still real, testable flexibility, not speculative. table_name is
+    restricted to _TOKEN_TABLE_CONFIG's keys since it's interpolated
+    directly into SQL (no placeholder syntax exists for identifiers); this
+    is safe only because it's fixed at construction time by our own code,
+    never external input."""
 
     def __init__(
         self,
@@ -183,11 +174,10 @@ class TokenVault:
         self._table_name = table_name
         # Bound once here, deliberately, not re-looked-up as a module global
         # inside get_access_token: this instance's refresh function is a
-        # construction-time fact (mcp_vault always needs mcp_auth's, vault
-        # always needs hubspot_oauth's), not something meant to vary call to
-        # call. A test that wants a different refresh_fn must construct a
-        # fresh TokenVault()/token_vault._mcp_vault() after monkeypatching —
-        # every test in this codebase already does exactly that.
+        # construction-time fact, not something meant to vary call to call.
+        # A test that wants a different refresh_fn must construct a fresh
+        # TokenVault() after monkeypatching — every test in this codebase
+        # already does exactly that.
         self._refresh_fn = refresh_fn if refresh_fn is not None else refresh_token_pair
         self._refresh_event = config["refresh_event"]
         self._invalidate_event = config["invalidate_event"]
@@ -206,9 +196,8 @@ class TokenVault:
             async with conn.transaction():
                 # pg_advisory_xact_lock auto-releases at transaction end, and
                 # is scoped per hub_id AND per table, so tenants never block
-                # each other, and vault/mcp_vault never block each other for
-                # the same tenant — only concurrent operations against the
-                # SAME table for the SAME tenant do.
+                # each other — only concurrent operations against the SAME
+                # table for the SAME tenant do.
                 await acquire_tenant_lock(conn, hub_id, self._table_name)
 
                 row = await conn.fetchrow(
@@ -250,7 +239,10 @@ class TokenVault:
 
         await self._cache.set(hub_id, access_token, new_expires_at)
         if refreshed:
-            await record_audit(self._refresh_event, hub_id=hub_id)
+            # best-effort: the refresh itself already committed above, an
+            # audit-log hiccup here shouldn't make a successful refresh
+            # look like a failure to the caller.
+            await record_audit_best_effort(self._refresh_event, hub_id=hub_id)
         return access_token
 
     @property
@@ -260,12 +252,12 @@ class TokenVault:
     async def invalidate_in_transaction(self, conn, hub_id: str) -> None:
         """The DB half of invalidate(), against an already-open
         transaction/connection the caller owns. Exposed as its own method
-        so hubspot_uninstall_webhook can invalidate both vault and
-        mcp_vault's rows (and the shared tenants.install_status flip) in
-        ONE transaction — a failure partway through rolls back everything
-        rather than leaving one vault's row deleted and the other's
-        orphaned. invalidate() below is just this wrapped in its own
-        connection for the common single-vault case."""
+        so a caller needing to invalidate a token row alongside another
+        mutation (e.g. the shared tenants.install_status flip) can do both
+        in ONE transaction — a failure partway through rolls back
+        everything rather than leaving one row deleted and the other
+        unaffected. invalidate() below is just this wrapped in its own
+        connection for the common single-mutation case."""
         await self._cache.invalidate(hub_id)
         await acquire_tenant_lock(conn, hub_id, self._table_name)
         await conn.execute(f"DELETE FROM {self._table_name} WHERE hub_id = $1", hub_id)
@@ -283,23 +275,11 @@ class TokenVault:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await self.invalidate_in_transaction(conn, hub_id)
-        await record_audit(self._invalidate_event, hub_id=hub_id)
+        # best-effort: the invalidation itself already committed above.
+        await record_audit_best_effort(self._invalidate_event, hub_id=hub_id)
 
 
 vault = TokenVault()
-
-
-def _mcp_vault() -> TokenVault:
-    # Deferred import: mcp_auth imports from hubspot_oauth (not from this
-    # module), so this doesn't create a cycle, but importing it lazily here
-    # keeps that dependency direction obvious rather than hidden at the top
-    # of the file alongside the Public App's own default.
-    from .mcp_auth import refresh_token_pair as mcp_refresh_token_pair
-
-    return TokenVault(table_name="mcp_tokens", refresh_fn=mcp_refresh_token_pair)
-
-
-mcp_vault = _mcp_vault()
 
 
 async def get_installed_hub_ids() -> list[str]:
@@ -345,19 +325,11 @@ async def hubspot_uninstall_webhook(request: Request) -> dict:
     if not hub_id:
         raise HTTPException(400, "Missing portal identifier")
 
-    # The MCP Auth App is a separate credential for the same portal (see
-    # mcp_auth.py) — HubSpot's uninstall webhook only ever names the Public
-    # App, but both credentials become dead the moment a client uninstalls.
-    # Both purges run in ONE transaction (not two independent invalidate()
-    # calls) so a transient failure on the second can't orphan a live
-    # mcp_tokens row for a tenant this system's own tenants table already
-    # considers uninstalled.
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             await vault.invalidate_in_transaction(conn, hub_id)
-            await mcp_vault.invalidate_in_transaction(conn, hub_id)
-    await record_audit(vault.invalidate_event, hub_id=hub_id)
-    await record_audit(mcp_vault.invalidate_event, hub_id=hub_id)
+    # best-effort: the invalidation itself already committed above.
+    await record_audit_best_effort(vault.invalidate_event, hub_id=hub_id)
     logger.info("hubspot_webhook.uninstalled", hub_id=hub_id)
     return {"status": "invalidated", "hub_id": hub_id}

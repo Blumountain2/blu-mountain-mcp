@@ -18,11 +18,13 @@ exist and whether they're currently installed.
 
 | Column | Type | Notes |
 | :-- | :-- | :-- |
-| `hub_id` | `TEXT` (PK) | HubSpot's portal identifier. Primary tenant key referenced by `tokens`, `rate_limit_buckets`, `audit_log`, `staff_tenant_restrictions`, `hubspot_object_index`. |
-| `portal_name` | `TEXT` | Reserved for a human-readable portal name. **Not currently populated by any code** — always `NULL` today. Nothing reads it either; safe to fill in later if a display name becomes useful, but it's dead weight right now. |
+| `hub_id` | `TEXT` (PK) | HubSpot's portal identifier. Primary tenant key referenced by `tokens`, `rate_limit_buckets`, `audit_log`, `staff_tenant_restrictions`, `hubspot_object_index`, `tenant_onboarding_profiles`. |
+| `portal_name` | `TEXT` | Human-curated display name, set only via `/install`'s optional `?portal_name=` query param (round-tripped through `oauth_states.portal_name`) — never auto-overwritten. |
+| `hub_domain` | `TEXT` | HubSpot's own domain for the portal, auto-captured from the OAuth access-token-info response on every install/reinstall. Readers should use `COALESCE(portal_name, hub_domain, hub_id)`, never `hub_domain` alone — this is the resolution order both the live session and `frameworks/onboarding.py::_effective_tenant_name` use. |
+| `vertical` | `TEXT` | The tenant's known vertical framework (e.g. `saas`, `plg`), staff-set via `frameworks/vertical.py::set_tenant_vertical` — **never inferred automatically**. `NULL` until a human sets it. `frameworks/onboarding.py::produce_onboarding_profile` reads this as its default when no vertical is passed explicitly; a profile produced with no vertical (and not explicitly `allow_unqualified=True`) is refused. Distinct from `tenant_onboarding_profiles.vertical`, which is a point-in-time snapshot taken when a profile was produced — this column is the current, live-updatable value. |
 | `install_status` | `TEXT` | `'installed'` (default, set on every successful `/callback`) or `'uninstalled'` (set by `auth/token_vault.py` when HubSpot's uninstall webhook fires). This is the flag that determines which tenants the scheduled sync (`sync/airtable_staging.py`) and the live session's default-open access (`session/live_session.py::_permitted_tenants`) both treat as "active" — an uninstalled tenant's row is kept, not deleted, but excluded from both. |
 | `installed_at` | `TIMESTAMPTZ` | Set once at first insert, never updated on re-install. |
-| `updated_at` | `TIMESTAMPTZ` | Bumped on every `install_status` change (re-install or uninstall). |
+| `updated_at` | `TIMESTAMPTZ` | Bumped on every `install_status` or `vertical` change. |
 
 Row lifecycle: created on `/callback` (`auth/hubspot_oauth.py::_persist_new_tenant`), `ON CONFLICT (hub_id) DO UPDATE` if the same portal re-installs. Never deleted by application code.
 
@@ -40,19 +42,13 @@ The encrypted token vault. Exactly one row per tenant, one-to-one with `tenants`
 
 Refreshes are serialized per tenant via `pg_advisory_xact_lock(hashtext(hub_id))` (see "Locking" below), so two instances/workers can never race to refresh the same tenant simultaneously — this table itself has no lock column; the lock is a separate Postgres primitive, not vault state.
 
-## `mcp_tokens`
+Read by `sync/hubspot_client.py::HubSpotDataPullClient` — since the REST pivot (`openspec/changes/hubspot-rest-api-pivot`), this is the only HubSpot credential in the system; it's used directly against `api.hubapi.com`.
 
-Same shape and purpose as `tokens` above, for a different credential: the MCP Auth App (spec Section 4.1), not the Public App. HubSpot's remote MCP endpoint (`mcp.hubspot.com`) is confirmed to be its own OAuth resource server (its own RFC 9728/8414 metadata, its own `oauth/v3/token` endpoint) and does not accept the Public App's CRM-scoped token — this table exists because that's a genuinely separate credential with its own independent refresh lifecycle, not because of any duplication. `hub_id` for this credential comes directly from the token-exchange response body, confirmed live; its introspection endpoint (`/oauth/v3/token/introspect`) returns only RFC 7662's minimal `{"active": true/false}`, no portal identifier, so `mcp_auth.py` doesn't call it at all.
+## `mcp_tokens` (removed)
 
-| Column | Type | Notes |
-| :-- | :-- | :-- |
-| `hub_id` | `TEXT` (PK, `REFERENCES tenants(hub_id) ON DELETE CASCADE`) | Same tenant identifier as `tokens`, but this row is only created by the MCP Auth App's own install (`/callback/mcp-auth`), a separate step from the Public App's install that creates the `tenants` row itself. Must happen second — `auth/mcp_auth.py`'s callback checks for a matching `tenants` row first and returns `409` with an explicit message if it's missing, rather than surfacing a raw FK-violation error. |
-| `encrypted_access_token` | `TEXT` | Same AES-256/HKDF scheme as `tokens`. |
-| `encrypted_refresh_token` | `TEXT` | Same scheme; `grant_types_supported` on `mcp.hubspot.com`'s own metadata confirms `refresh_token` is supported, same as the Public App. |
-| `expires_at` | `TIMESTAMPTZ` | Same 5-minute proactive-refresh buffer, via a second `TokenVault` instance (`auth.mcp_vault`) constructed with `table_name="mcp_tokens"` and `mcp_auth.refresh_token_pair` — `TokenVault` was made parameter­izable specifically so this table didn't need its own duplicated vault class. |
-| `last_refreshed_at` | `TIMESTAMPTZ` | Same as `tokens`. |
+Dropped (`DROP TABLE IF EXISTS mcp_tokens;` in `schema.sql`, applied idempotently on every startup) as part of the REST pivot's cutover (`openspec/changes/hubspot-rest-api-pivot`, 2026-09-02). Formerly a second token vault, same shape as `tokens`, for the MCP Auth App (spec Section 4.1) — a separate credential HubSpot's remote MCP endpoint (`mcp.hubspot.com`) required, since it didn't accept the Public App's own token. `HubSpotDataPullClient` now reads `api.hubapi.com` directly with the Public App's token instead, so this second credential and its vault are no longer needed. The real vaulted MCP Auth tokens this held were already dead by the time the drop ran — the MCP Auth App's registration itself was deleted directly in HubSpot's developer account, not just this table.
 
-Read by `sync/hubspot_client.py::HubSpotDataPullClient` exclusively — this is the token actually used to connect to `mcp.hubspot.com`; `tokens` (the Public App's) is never used for that connection.
+`TokenVault` (`auth/token_vault.py`) stays parameterized by `table_name`/`refresh_fn` even though only one instance (`vault`) exists now — real, testable flexibility kept from when this table's second instance (`mcp_vault`) also existed, not speculative scaffolding.
 
 ## `oauth_states`
 
@@ -62,6 +58,7 @@ Short-lived, in-flight PKCE state for Flow B, between `/install` and `/callback`
 | :-- | :-- | :-- |
 | `state` | `TEXT` (PK) | Random `secrets.token_urlsafe(32)` value, round-tripped through HubSpot's authorize URL and back. |
 | `code_verifier` | `TEXT` | The PKCE verifier generated alongside the state; retrieved and deleted together on a valid `/callback`. |
+| `portal_name` | `TEXT` | Carries `/install`'s optional `?portal_name=` query param across the redirect round-trip, the same way `code_verifier` does; written into `tenants.portal_name` on a successful `/callback`. |
 | `created_at` | `TIMESTAMPTZ` | Used to enforce the 10-minute validity window (`created_at > now() - interval '10 minutes'`) — a state older than that is treated as expired even if never explicitly deleted. |
 
 Row lifecycle: inserted on `/install`, deleted on a **successful** `/callback` (the delete and the validity check happen in the same `DELETE ... RETURNING` statement). **A state that's never completed — the admin abandons the flow, closes the tab — is never deleted.** It's functionally expired after 10 minutes (the `created_at` check rejects it), but the row itself stays forever; there's no reaper job. Harmless at current volume (small rows, no sensitive data beyond a single-use verifier), but worth knowing if this table's row count is ever audited.
@@ -127,6 +124,82 @@ Resolves which tenant a HubSpot object ID belongs to — the mechanism that lets
 
 Populated as `company`/`deal` objects are staged by the scheduled sync job (`Source ID` from the staged Airtable row). Looked up via Sybill's `crmInfo.accountId`/`opportunityId` fields (`webhooks/sybill.py::resolve_hub_id`); a `(object_type, object_id)` pair is only trusted for tenant resolution if it maps to **exactly one** distinct `hub_id` — zero matches (not staged yet) or more than one (a same object ID colliding across two portals) are both rejected outright rather than guessed at, since a wrong guess here would be a cross-tenant leak. Indexed on `(object_type, object_id)` (`idx_hubspot_object_index_lookup`) for that lookup direction specifically.
 
+## `analysis_content`
+
+Blu Mountain's own-authored analysis content (`gateway/frameworks/`, see `openspec/changes/analysis-model-templates/`) — this project stores and serves this content verbatim, it never authors or edits it. Append-only by convention: `store.py::ingest()` always inserts a new row, never updates one in place, so a `tenant_onboarding_profile_fields.framework_guidance` value produced against an earlier version can never silently change out from under it.
+
+| Column | Type | Notes |
+| :-- | :-- | :-- |
+| `id` | `SERIAL` (PK) | |
+| `content_type` | `TEXT` | One of six values, more than `schema.sql`'s own inline comment names (`vertical_framework`, `skill`, `prompt`) — confirmed from `frameworks/store.py`'s actual validated set: those three plus `challenge_library`, `operating_principles`, `template_library` (added task 7.1, the six per-vertical Challenge Library documents plus the two content-agnostic Blu Operating Principles / Template Library pieces). Enforced by `store.py::_validate_content_type` against a fixed set, not a DB-level `CHECK`. |
+| `name` | `TEXT` | E.g. `saas`, `plg`, `marketplace`, `ecommerce`, `services-project`, `transactional` for `vertical_framework`; `account-diagnostic-skill` for `skill`; `weekly-diagnostic-prompt` for `prompt` — the skill/prompt types have exactly one real name each today, but nothing in the schema or code assumes that stays true. |
+| `version` | `INTEGER` | 1 for a never-before-seen `(content_type, name)`, otherwise one more than the current max — computed in `ingest()`, not a DB sequence, so concurrent ingests of the same name could in principle race (accepted: this content is ingested occasionally and by hand, not under concurrent load). |
+| `content` | `TEXT` | The verbatim document body. |
+| `source_path` | `TEXT` (nullable) | Where the content was ingested from, if applicable. |
+| `ingested_at` | `TIMESTAMPTZ` | Set once at insert. |
+
+Unique on `(content_type, name, version)`; indexed on `(content_type, name, version DESC)` (`idx_analysis_content_lookup`) for `get_latest()`'s and `list_latest()`'s own query shape. Read by `frameworks/onboarding.py` (via `profiling.py`) when a profile auto-confirms a field against framework guidance, and by `frameworks/vertical.py`'s `KNOWN_VERTICALS` (derived from `ingest.py::FILE_MAP`, not this table directly) to validate a staff-set `tenants.vertical`.
+
+## `tenant_onboarding_profiles`
+
+A lightweight, named, per-tenant snapshot of which HubSpot fields are confirmed relevant for that tenant's analysis (task 3, `specs/tenant-template-instantiation/spec.md`) — the runtime parameter meant to accompany a shared vertical framework at invocation time, **never** a copy of the framework/skill/prompt itself, which stay shared and unmodified in `analysis_content` above.
+
+| Column | Type | Notes |
+| :-- | :-- | :-- |
+| `id` | `SERIAL` (PK) | Referenced by `tenant_onboarding_profile_fields.profile_id`. |
+| `hub_id` | `TEXT` (`REFERENCES tenants(hub_id) ON DELETE CASCADE`) | Isolation is structural here, not just conventional: every read/write in `frameworks/onboarding.py` takes `hub_id` and enforces it directly in the query (a JOIN/WHERE clause) — a profile belonging to one tenant cannot be fetched or mutated through another tenant's `hub_id`, by construction, not just by caller discipline. |
+| `name` | `TEXT` | A snapshot of the tenant's effective display name (`COALESCE(portal_name, hub_domain, hub_id)`) **at production time**, not a live join — matches `analysis_content`'s versioned-snapshot philosophy, so it doesn't silently change if the tenant is later renamed. |
+| `vertical` | `TEXT` (nullable) | The vertical this specific profile was produced against — a point-in-time snapshot, distinct from the current, live-updatable `tenants.vertical`. `NULL` only if the profile was deliberately produced unqualified (`allow_unqualified=True`). |
+| `created_at` | `TIMESTAMPTZ` | Set once at insert; `get_latest_profile_for_tenant()` orders on this to find a tenant's most recent profile. Nothing purges old profiles. |
+
+Indexed on `hub_id` (`idx_tenant_onboarding_profiles_hub_id`). Produced by `frameworks/onboarding.py::produce_onboarding_profile()`, which reuses the existing, already-allowlisted `pull_crm_objects()` (no new HubSpot access path) via `frameworks/profiling.py`. Read by the vertical pull agent (task 8, `specs/vertical-pull-agent/spec.md`) via `get_latest_profile_for_tenant()`, to inject a client's confirmed-relevant fields into its per-tenant prompt.
+
+## `tenant_onboarding_profile_fields`
+
+One row per populated field a profile considered — only ever populated fields, since an unpopulated field has nothing to analyze regardless of framework guidance and is never a candidate.
+
+| Column | Type | Notes |
+| :-- | :-- | :-- |
+| `profile_id` | `INTEGER` (`REFERENCES tenant_onboarding_profiles(id) ON DELETE CASCADE`) | Part of composite PK. |
+| `object_type` | `TEXT` | HubSpot object type the field belongs to (e.g. `contacts`, `deals`). Part of composite PK. |
+| `property_name` | `TEXT` | Part of composite PK. |
+| `status` | `TEXT` | `confirmed_relevant` (auto-confirmed at production time if the tenant's vertical framework already had explicit guidance — `trust_by_default` or `unreliable_by_default`, either counts as the framework actively discussing the field), `confirmed_irrelevant`, or `needs_review` (no framework guidance existed at production time — a human must decide via `review_field()`). A profile is "final" (`OnboardingProfile.is_final`) only once no field is left at `needs_review`. |
+| `framework_guidance` | `TEXT` (nullable) | The framework's own guidance text for this field, carried over at auto-confirm time; `NULL` for a `needs_review` field. |
+| `reviewed_by` | `TEXT` (nullable) | Set by `review_field()` when a human moves a field off `needs_review`. |
+| `reviewed_at` | `TIMESTAMPTZ` (nullable) | Set alongside `reviewed_by`. |
+
+`review_field()` scopes its `UPDATE` through a JOIN back to `tenant_onboarding_profiles.hub_id`, the same structural isolation as the profile table itself — a review action can never target a profile belonging to a different tenant.
+
+## `vertical_agent_templates`
+
+Added `openspec/changes/separate-vertical-client-agents` (2026-09-01) — a deliberate, knowing supersession of `analysis-model-templates/design.md`'s original Non-Negotiable #6 ("one agent config per vertical, shared across every client, no per-client persistence"); see that Non-Negotiable's own note for the full reasoning. One independently-editable, versioned agent template per vertical — this project's own tool/model configuration layered around a vertical framework's raw text (`analysis_content` above), never a copy of that framework itself, which stays shared, unmodified, and Blu-Mountain-authored.
+
+| Column | Type | Notes |
+| :-- | :-- | :-- |
+| `id` | `SERIAL` (PK) | Referenced by `client_agent_instances.vertical_template_id`. |
+| `vertical` | `TEXT` | One of the six known verticals (`frameworks.vertical.KNOWN_VERTICALS`); validated at insert, not DB-enforced. |
+| `version` | `INTEGER` | Append-only, same pattern as `analysis_content.version` — `ingest_template()` always inserts a new version, never updates one in place, so a `client_agent_instances` row built from an earlier version keeps reading that exact version even after the vertical's template is updated. |
+| `system_prompt_additions` | `TEXT` | This vertical's own agent-configuration text (tool-use guidance, prioritization, style), layered after the raw framework text in the agent's system prompt (`frameworks/pull_agent.py::_system_prompt`). Empty string is valid and common — the six verticals were bootstrapped with empty additions specifically so day-one behavior didn't regress from the prior single-tier agent. |
+| `tool_config` | `JSONB` | Defaults to `'{}'::jsonb`. Currently reads one optional key, `max_tool_calls` (overrides `pull_agent.MAX_TOOL_CALLS` for that vertical's runs) — not a fixed schema, room for more per-vertical tool/model parameters later. |
+| `created_at` | `TIMESTAMPTZ` | Set once at insert. |
+
+Unique on `(vertical, version)`; indexed on `(vertical, version DESC)` (`idx_vertical_agent_templates_lookup`) for `get_latest_template()`'s query shape. Staff-editable directly (`frameworks/vertical_templates.py::ingest_template`) — no separate review/ingestion pipeline, since this is this project's own configuration, not Blu Mountain's authored content.
+
+## `client_agent_instances`
+
+Added alongside `vertical_agent_templates` above, same change. The genuinely new per-client artifact this change introduces: one persisted, versioned agent instance per client, built from that client's vertical's current template plus that client's own injected documentation. Superseded the prior design's "context assembled fresh on every run, nothing persisted" model — this table is a durable, independently-editable per-client record now.
+
+| Column | Type | Notes |
+| :-- | :-- | :-- |
+| `id` | `SERIAL` (PK) | |
+| `hub_id` | `TEXT` (`REFERENCES tenants(hub_id) ON DELETE CASCADE`) | Isolation is structural, matching `tenant_onboarding_profiles`: every read/write in `frameworks/client_agent.py` enforces `hub_id` directly in the query, never a Python-level check a caller could skip. |
+| `vertical_template_id` | `INTEGER` (`REFERENCES vertical_agent_templates(id)`) | A real FK to the exact template version this instance was built from — not a copied `(vertical, version)` pair — so an instance is always traceable to precisely one template row, even after that vertical's template is later updated. |
+| `version` | `INTEGER` | Append-only per `hub_id`, same versioned-snapshot philosophy as everywhere else in this project — a new instance is always a new row, never a mutation, so an in-flight run keeps using the version it started with. |
+| `injected_documentation` | `TEXT` | A rendered snapshot of this client's onboarding-profile confirmed-relevant fields (same content shape as the prior ephemeral `pull_agent._client_context_block`, now persisted instead of recomputed on every run) — taken at production time, not a live join. |
+| `created_at` | `TIMESTAMPTZ` | Set once at insert. |
+
+Indexed on `(hub_id, created_at DESC)` (`idx_client_agent_instances_hub_id`) for `get_latest_client_agent_instance()`'s query shape. Produced by `frameworks/client_agent.py::produce_client_agent_instance()`, which refuses to run for a tenant with no known vertical (matching `produce_onboarding_profile`'s existing refusal posture) and refuses if the resolved vertical has no `vertical_agent_templates` row yet. `frameworks/pull_agent.py::run_client_agent(hub_id)` (replacing the old `run_pull_agent(hub_id, vertical)`) resolves — and produces on first use — the instance for every run.
+
 ## Locking (not a table)
 
 Per-tenant refresh serialization (SC-4) uses `pg_advisory_xact_lock(hashtext(hub_id))` directly — a Postgres primitive keyed by the hash of the tenant's `hub_id` string, scoped to the current transaction (auto-released when it ends). There is no dedicated lock table; this is why `tokens` has no lock-related column. Two different tenants hash to (almost certainly) different lock keys, so they never block each other; two refreshes for the *same* tenant serialize correctly even across multiple service instances, since the lock lives in Postgres itself, not in any one instance's memory.
@@ -134,6 +207,6 @@ Per-tenant refresh serialization (SC-4) uses `pg_advisory_xact_lock(hashtext(hub
 ## Cross-cutting notes
 
 - **Every tenant-scoped table keys on `hub_id` as plain `TEXT`**, not a surrogate integer ID — this is deliberate: `hub_id` is externally meaningful (it's HubSpot's own identifier) and appears in every log line, audit entry, and API response as-is, so there's no separate internal-ID-to-`hub_id` mapping to keep in sync anywhere.
-- **Encryption at rest is scoped to exactly four columns**: `tokens.encrypted_access_token`/`encrypted_refresh_token` and `mcp_tokens.encrypted_access_token`/`encrypted_refresh_token` — the two vaulted credentials, encrypted identically (same AES-256/HKDF scheme, distinct per-tenant derived keys). Nothing else in this schema is encrypted at the column level — `staff_tenant_restrictions`, `audit_log`, etc. are plain text, which is fine since none of them hold a credential.
-- **Nothing in this schema is ever hard-deleted except via the two explicit purges** described above (`oauth_states` on successful callback, `audit_log` via the daily scheduled retention purge) and the `ON DELETE CASCADE` from `tenants` to `tokens` and `mcp_tokens` alike. Everything else (uninstalled tenants, old session selections, restriction rows) is left in place indefinitely by design or by current omission — see each table's notes above for which is which.
+- **Encryption at rest is scoped to exactly two columns**: `tokens.encrypted_access_token`/`encrypted_refresh_token` — the one vaulted credential, AES-256/HKDF, distinct per-tenant derived keys. Nothing else in this schema is encrypted at the column level — `staff_tenant_restrictions`, `audit_log`, etc. are plain text, which is fine since none of them hold a credential. (Formerly four columns, `mcp_tokens` included — dropped as part of the REST pivot, see that table's own note above.)
+- **Nothing in this schema is ever hard-deleted except via the two explicit purges** described above (`oauth_states` on successful callback, `audit_log` via the daily scheduled retention purge) and the `ON DELETE CASCADE` chains from `tenants` — to `tokens` directly, to `tenant_onboarding_profiles` (which itself cascades to `tenant_onboarding_profile_fields`), and to `client_agent_instances`. Everything else (uninstalled tenants, old session selections, restriction rows, `analysis_content`, `vertical_agent_templates` — vertical-scoped, not tenant-scoped, so no cascade applies) is left in place indefinitely by design or by current omission — see each table's notes above for which is which.
 - **This schema is applied against two separate real databases**: `mcp` (via `docker compose up`'s dev stack) and `mcp_test` (created automatically by `gateway/tests/conftest.py` on first test run). They share nothing — the test suite truncates every table it touches after each test, and running it against `mcp` directly destroyed a real, verified tenant install twice in one session before this separation was added.

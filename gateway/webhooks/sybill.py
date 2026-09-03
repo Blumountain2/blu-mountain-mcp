@@ -22,9 +22,11 @@ was first built, but which does not match what the real, current API
 actually sends: one combined data.crm.id/data.crm.type object, using
 Salesforce-flavored terminology ("opportunity") rather than HubSpot's own
 ("deal"). Both spellings are accepted below since Sybill supports both
-CRMs against what looks like one shared schema; only "opportunity" is
-confirmed live so far — "account" is inferred from the same convention,
-not yet confirmed against a real company-linked event.
+CRMs against what looks like one shared schema; both "opportunity" and
+"account" are confirmed live — "account" via a real production payload
+for a company-linked meeting (hub_id unresolvable there since it's a
+real client portal, not one of this project's own test portals, but the
+crm.type value itself is real, confirmed 2026-08-19).
 """
 
 import base64
@@ -87,9 +89,9 @@ def verify_svix_signature(
     return False
 
 
-# Sybill's crm.type uses Salesforce-flavored terminology ("opportunity"),
-# confirmed live; "account" is the same convention's presumed company-side
-# counterpart, not yet confirmed against a real payload. HubSpot's own
+# Sybill's crm.type uses Salesforce-flavored terminology ("opportunity",
+# "account") — both confirmed live, the latter via a real production
+# payload for a company-linked meeting (2026-08-19). HubSpot's own
 # terminology ("deal"/"company") is accepted too in case a future event
 # ever uses it directly, since accepting an extra, never-seen spelling
 # costs nothing and only widens what resolves correctly.

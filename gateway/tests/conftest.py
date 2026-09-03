@@ -28,9 +28,8 @@ _TEST_ENV = {
     "HUBSPOT_APP_CLIENT_ID": "test-app-client-id",
     "HUBSPOT_APP_CLIENT_SECRET": "test-app-client-secret",
     "HUBSPOT_REDIRECT_URI": "http://localhost:8888/callback",
-    "HUBSPOT_MCP_CLIENT_ID": "test-mcp-client-id",
-    "HUBSPOT_MCP_CLIENT_SECRET": "test-mcp-client-secret",
-    "HUBSPOT_MCP_REDIRECT_URI": "http://localhost:8888/callback/mcp-auth",
+    "HUBSPOT_SCOPES": "crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read tickets",
+    "HUBSPOT_OPTIONAL_SCOPES": "",
     "FASTMCP_GOOGLE_CLIENT_ID": "test-google-client-id",
     "FASTMCP_GOOGLE_CLIENT_SECRET": "test-google-client-secret",
     "FASTMCP_BASE_URL": "http://localhost:8888",
@@ -39,6 +38,7 @@ _TEST_ENV = {
     "AIRTABLE_API_KEY": "test-airtable-key",
     "AIRTABLE_BASE_ID": "appTEST00000000000",
     "SYBILL_WEBHOOK": "whsec_dGVzdC1zZWNyZXQta2V5LWZvci10ZXN0cw==",
+    "DEBUG_API_KEY": "test-debug-api-key",
     "DATABASE_URL": _TEST_DATABASE_URL,
 }
 for _key, _value in _TEST_ENV.items():
@@ -52,7 +52,6 @@ from config import settings
 
 _TABLES = [
     "tokens",
-    "mcp_tokens",
     "tenants",
     "oauth_states",
     "rate_limit_buckets",
@@ -60,6 +59,11 @@ _TABLES = [
     "staff_tenant_restrictions",
     "live_session_selection",
     "hubspot_object_index",
+    "analysis_content",
+    "tenant_onboarding_profile_fields",
+    "tenant_onboarding_profiles",
+    "client_agent_instances",
+    "vertical_agent_templates",
 ]
 
 

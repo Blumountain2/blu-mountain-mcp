@@ -1,135 +1,352 @@
-"""Task 3.6: proves a per-tenant HubSpot pull produces a complete read-only
-snapshot with no cross-tenant token or data leakage, and that write-shaped
-tools are never called. Uses a fake MCP client, no real HubSpot connection."""
+"""Proves a per-tenant HubSpot pull (REST-based, api.hubapi.com — see
+openspec/changes/hubspot-rest-api-pivot) produces a complete read-only
+snapshot with no cross-tenant token or data leakage, and that only
+recognized capability names can be dispatched. Uses a fake httpx.AsyncClient,
+no real HubSpot connection — matching test_hubspot_oauth.py's own use of
+bare httpx.Response objects, extended here to a small routing fake since
+HubSpotDataPullClient issues several distinct calls per pull rather than one."""
 
-import json
-from types import SimpleNamespace
-
+import httpx
 import pytest
 
 from sync import hubspot_client
-from sync.hubspot_client import HubSpotDataPullClient, ReadOnlyViolation
+from sync.hubspot_client import HubSpotDataPullClient, HubSpotRateLimited, ReadOnlyViolation
 
 
-class _FakeTool:
-    def __init__(self, name):
-        self.name = name
+def _resp(status_code: int, body: dict) -> httpx.Response:
+    request = httpx.Request("GET", "https://api.hubapi.com/fake")
+    return httpx.Response(status_code, json=body, request=request)
 
 
-class _FakeResult:
-    def __init__(self, data):
-        self.data = data
+def _page(results: list[dict], next_after: str | None = None) -> httpx.Response:
+    paging = {"next": {"after": next_after}} if next_after else {}
+    return _resp(200, {"results": results, "paging": paging})
 
 
-class _FakeMCPClient:
-    def __init__(self, tools, responses):
-        self._tools = [_FakeTool(name) for name in tools]
-        self._responses = responses
-        self.called_with_token = None
+class _FakeAsyncClient:
+    """Minimal httpx.AsyncClient stand-in: dispatches GET/POST calls to
+    per-path handler functions, recording every call for assertions.
+    Handlers receive the call's params/json body and return an
+    httpx.Response — same shape asyncio callers see from the real thing."""
 
-    async def __aenter__(self):
-        return self
+    def __init__(self, get_handlers: dict | None = None, post_handlers: dict | None = None):
+        self._get_handlers = get_handlers or {}
+        self._post_handlers = post_handlers or {}
+        self.calls: list[tuple[str, str, dict, dict]] = []
 
-    async def __aexit__(self, *exc_info):
-        return False
+    def _path(self, url: str) -> str:
+        return url.replace(hubspot_client.HUBSPOT_API_BASE, "")
 
-    async def list_tools(self):
-        return self._tools
+    async def get(self, url, headers=None, params=None):
+        path = self._path(url)
+        self.calls.append(("GET", path, params or {}, headers or {}))
+        handler = self._get_handlers.get(path)
+        if handler is None:
+            raise AssertionError(f"no fake GET handler registered for {path}")
+        return handler(params or {})
 
-    async def call_tool(self, name, params):
-        return _FakeResult(self._responses.get(name, {"id": f"{name}-1"}))
+    async def post(self, url, headers=None, json=None):
+        path = self._path(url)
+        self.calls.append(("POST", path, json or {}, headers or {}))
+        handler = self._post_handlers.get(path)
+        if handler is None:
+            raise AssertionError(f"no fake POST handler registered for {path}")
+        return handler(json or {})
+
+    async def aclose(self):
+        pass
 
 
-def _patch_client(monkeypatch, tools, responses, token_log):
-    async def fake_client(self, access_token):
-        token_log.setdefault(self.hub_id, []).append(access_token)
-        return _FakeMCPClient(tools, responses)
+def _patch_client_for_hub(monkeypatch, client_factory, token_log: dict | None = None):
+    """client_factory: hub_id -> _FakeAsyncClient. Patches _client_for_hub
+    (the owns-client path every pull method takes when called with no
+    explicit `client=`) so tests never touch a real vault or real HubSpot.
+    token_log, when given, records which hub_id each fake client's headers
+    were built for — what the isolation tests below check."""
 
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
+    async def fake_client_for_hub(self):
+        fake = client_factory(self.hub_id)
+        headers = {"Authorization": f"Bearer access-token-for-{self.hub_id}"}
+        if token_log is not None:
+            token_log.setdefault(self.hub_id, []).append(headers["Authorization"])
+        return fake, headers
 
-    async def fake_get_access_token(hub_id):
-        return f"access-token-for-{hub_id}"
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
 
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
+
+def _assert_tokens_never_cross(token_log: dict[str, list[str]]) -> None:
+    """Shared by every "only uses this tenant's token" isolation test in
+    this file."""
+    assert token_log["hub_a"] == ["Bearer access-token-for-hub_a"]
+    assert token_log["hub_b"] == ["Bearer access-token-for-hub_b"]
+    assert "Bearer access-token-for-hub_b" not in token_log["hub_a"]
+    assert "Bearer access-token-for-hub_a" not in token_log["hub_b"]
+
+
+# --- pull_crm_objects: standard object types via /crm/v3/objects/{slug} ---
 
 
 @pytest.mark.asyncio
-async def test_list_read_only_tools_excludes_write_tools_and_out_of_scope(monkeypatch):
-    tools = [
-        "list_contacts",
-        "create_contact",
-        "search_deals",
-        "update_deal",
-        "delete_ticket",
-        "unrelated_widget_tool",
-    ]
-    _patch_client(monkeypatch, tools, {}, {})
+async def test_pull_crm_objects_queries_every_standard_object_type(monkeypatch):
+    seen_paths: list[str] = []
+
+    def factory(hub_id):
+        def handler(params):
+            return _page([{"id": "1", "properties": {}}])
+
+        client = _FakeAsyncClient(get_handlers={f"/crm/v3/objects/{slug}": handler for slug in hubspot_client.CRM_OBJECT_REST_SLUGS.values()})
+        return client
+
+    _patch_client_for_hub(monkeypatch, factory)
 
     client = HubSpotDataPullClient("hub_a")
-    selected = await client.list_read_only_tools()
+    result = await client.pull_crm_objects(object_types=list(hubspot_client.CRM_OBJECT_REST_SLUGS.keys()))
 
-    assert "list_contacts" in selected
-    assert "search_deals" in selected
-    assert "create_contact" not in selected
-    assert "update_deal" not in selected
-    assert "delete_ticket" not in selected
-    assert "unrelated_widget_tool" not in selected
-
-
-def test_is_read_safe_rejects_unrecognized_name_with_no_read_verb():
-    """The actual scenario this guard exists for: a mutating action whose
-    name contains no word in _WRITE_VERBS and no recognized read verb
-    either. A blocklist-only check would have called this "safe" purely
-    because nothing matched; the read-verb allowlist must reject it
-    instead, since this module's token carries no OAuth scope of its own
-    to fall back on."""
-    assert hubspot_client._is_read_safe("notify_owner") is False
-    assert hubspot_client._is_read_safe("flag_deal") is False
-    assert hubspot_client._is_read_safe("ping_ticket") is False
-
-
-def test_is_read_safe_rejects_write_verb_even_with_a_recognized_write_word():
-    # close/resolve/assign are themselves in the broadened _WRITE_VERBS —
-    # caught by the write-verb check directly, not just by lacking a read
-    # verb (see test_is_read_safe_rejects_unrecognized_name_with_no_read_verb
-    # for that separate, no-verb-at-all case).
-    assert hubspot_client._is_read_safe("close_ticket") is False
-    assert hubspot_client._is_read_safe("resolve_ticket") is False
-    assert hubspot_client._is_read_safe("assign_deal") is False
-
-
-def test_is_read_safe_rejects_compound_name_with_read_and_write_verb():
-    # The gap a bare "has a read verb, has no write verb" check would
-    # miss: a name that has BOTH. A tool like this would otherwise pass
-    # _has_write_verb (no listed write verb) purely because the read verb
-    # happens to come first in the name.
-    assert hubspot_client._is_read_safe("get_and_send_email") is False
-    assert hubspot_client._is_read_safe("search_and_enroll_contacts") is False
-
-
-def test_is_read_safe_accepts_recognized_read_verbs():
-    assert hubspot_client._is_read_safe("list_contacts") is True
-    assert hubspot_client._is_read_safe("get_deal") is True
-    assert hubspot_client._is_read_safe("search_tickets") is True
+    assert set(result.keys()) == set(hubspot_client.CRM_OBJECT_REST_SLUGS.keys())
+    for object_type, records in result.items():
+        assert records == [{"id": "1", "properties": {}}]
 
 
 @pytest.mark.asyncio
-async def test_list_read_only_tools_excludes_unrecognized_names_even_without_write_verb(monkeypatch):
-    """Distinct from the write-tools case: a name with neither a write verb
-    nor a read verb must still be excluded, not defaulted to safe."""
-    tools = ["list_contacts", "close_ticket"]
-    _patch_client(monkeypatch, tools, {}, {})
-
+async def test_pull_crm_objects_follows_pagination():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/objects/contacts": lambda params: (
+                _page([{"id": "1"}], next_after="cursor-2") if params.get("after") is None else _page([{"id": "2"}])
+            )
+        }
+    )
     client = HubSpotDataPullClient("hub_a")
-    selected = await client.list_read_only_tools()
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["CONTACT"], properties={})
 
-    assert "list_contacts" in selected
-    assert "close_ticket" not in selected
+    assert result["CONTACT"] == [{"id": "1"}, {"id": "2"}]
+    assert [c[2].get("after") for c in fake.calls] == [None, "cursor-2"]
 
 
 @pytest.mark.asyncio
-async def test_pull_object_refuses_write_shaped_tool(monkeypatch):
-    _patch_client(monkeypatch, ["create_contact"], {}, {})
+async def test_pull_crm_objects_pull_failure_for_one_type_does_not_leak_into_others():
+    def contacts_handler(params):
+        raise RuntimeError("simulated upstream failure")
+
+    def companies_handler(params):
+        return _page([{"id": "c-1"}])
+
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/objects/contacts": contacts_handler,
+            "/crm/v3/objects/companies": companies_handler,
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["CONTACT", "COMPANY"])
+
+    assert result["CONTACT"] == {"error": "pull_failed"}
+    assert result["COMPANY"] == [{"id": "c-1"}]
+
+
+@pytest.mark.asyncio
+async def test_pull_crm_objects_treats_429_as_pull_failed_not_a_crash():
+    def rate_limited(params):
+        return _resp(429, {})
+
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/contacts": rate_limited})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["CONTACT"])
+
+    assert result["CONTACT"] == {"error": "pull_failed"}
+
+
+@pytest.mark.asyncio
+async def test_pull_crm_objects_uses_explicit_properties_when_given():
+    seen_params = {}
+
+    def contacts_handler(params):
+        seen_params["CONTACT"] = params
+        return _page([])
+
+    def companies_handler(params):
+        seen_params["COMPANY"] = params
+        return _page([])
+
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/objects/contacts": contacts_handler,
+            "/crm/v3/objects/companies": companies_handler,
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    await client.pull_crm_objects(
+        client=fake, headers={},
+        object_types=["CONTACT", "COMPANY"],
+        properties={"CONTACT": ["email", "custom_lead_score"]},
+    )
+
+    assert seen_params["CONTACT"]["properties"] == "email,custom_lead_score"
+    # COMPANY had no entry in properties — no properties param sent at all,
+    # so HubSpot returns its own default set (unchanged behavior).
+    assert "properties" not in seen_params["COMPANY"]
+
+
+@pytest.mark.asyncio
+async def test_pull_crm_objects_property_selection_is_exclusive_not_additive():
+    """Real behavior change from the prior MCP-based mechanism, confirmed
+    live (openspec/changes/hubspot-rest-api-pivot, task 2.3): REST's
+    properties= param narrows the response to exactly the requested
+    fields, not additively alongside the default set. This test locks in
+    the request shape that produces that: exactly the requested names, no
+    default-set names mixed in."""
+    seen_params = {}
+
+    def handler(params):
+        seen_params["CONTACT"] = params
+        return _page([{"id": "1", "properties": {"jobtitle": "CEO"}}])
+
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/contacts": handler})
+    client = HubSpotDataPullClient("hub_a")
+    await client.pull_crm_objects(client=fake, headers={}, object_types=["CONTACT"], properties={"CONTACT": ["jobtitle"]})
+
+    assert seen_params["CONTACT"]["properties"] == "jobtitle"
+
+
+@pytest.mark.asyncio
+async def test_pull_crm_objects_falls_back_to_default_when_properties_list_is_empty():
+    seen_params = {}
+
+    def handler(params):
+        seen_params["CONTACT"] = params
+        return _page([])
+
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/contacts": handler})
+    client = HubSpotDataPullClient("hub_a")
+    await client.pull_crm_objects(client=fake, headers={}, object_types=["CONTACT"], properties={"CONTACT": []})
+
+    assert "properties" not in seen_params["CONTACT"]
+
+
+@pytest.mark.asyncio
+async def test_pull_crm_objects_filters_unsafe_property_names_defensively():
+    seen_params = {}
+
+    def handler(params):
+        seen_params["CONTACT"] = params
+        return _page([])
+
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/contacts": handler})
+    client = HubSpotDataPullClient("hub_a")
+    await client.pull_crm_objects(
+        client=fake, headers={}, object_types=["CONTACT"], properties={"CONTACT": ["email", "bad; name"]}
+    )
+
+    assert seen_params["CONTACT"]["properties"] == "email"
+
+
+@pytest.mark.asyncio
+async def test_pull_uses_only_this_tenants_token_never_anothers(monkeypatch):
+    token_log: dict[str, list[str]] = {}
+
+    def factory(hub_id):
+        return _FakeAsyncClient(get_handlers={"/crm/v3/objects/contacts": lambda params: _page([])})
+
+    _patch_client_for_hub(monkeypatch, factory, token_log)
+
+    client_a = HubSpotDataPullClient("hub_a")
+    client_b = HubSpotDataPullClient("hub_b")
+    await client_a.pull_crm_objects(object_types=["CONTACT"])
+    await client_b.pull_crm_objects(object_types=["CONTACT"])
+
+    _assert_tokens_never_cross(token_log)
+
+
+# --- non-standard object families: each routed to its own adapter ---
+
+
+@pytest.mark.asyncio
+async def test_campaign_routes_to_marketing_campaigns_api():
+    fake = _FakeAsyncClient(get_handlers={"/marketing/v3/campaigns": lambda params: _page([{"id": "cmp-1"}])})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["CAMPAIGN"])
+
+    assert result["CAMPAIGN"] == [{"id": "cmp-1"}]
+
+
+@pytest.mark.asyncio
+async def test_landing_page_routes_to_cms_api():
+    fake = _FakeAsyncClient(get_handlers={"/cms/v3/pages/landing-pages": lambda params: _page([{"id": "lp-1"}])})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["LANDING_PAGE"])
+
+    assert result["LANDING_PAGE"] == [{"id": "lp-1"}]
+
+
+@pytest.mark.asyncio
+async def test_blog_post_routes_to_cms_api():
+    fake = _FakeAsyncClient(get_handlers={"/cms/v3/blogs/posts": lambda params: _page([{"id": "bp-1"}])})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["BLOG_POST"])
+
+    assert result["BLOG_POST"] == [{"id": "bp-1"}]
+
+
+@pytest.mark.asyncio
+async def test_object_list_routes_to_lists_search_as_a_read_despite_being_a_post():
+    def search_handler(body):
+        assert body == {"count": 100, "offset": 0}
+        return _resp(200, {"lists": [{"listId": "l-1"}]})
+
+    fake = _FakeAsyncClient(post_handlers={"/crm/v3/lists/search": search_handler})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["OBJECT_LIST"])
+
+    assert result["OBJECT_LIST"] == [{"listId": "l-1"}]
+
+
+@pytest.mark.asyncio
+async def test_object_list_paginates_past_the_first_page():
+    # Lists Search paginates via hasMore/offset in the response body, not
+    # the standard paging.next.after cursor shape _paginate handles.
+    # Previously _pull_lists made exactly one call and never looped,
+    # silently dropping every list past the first 100.
+    def search_handler(body):
+        if body["offset"] == 0:
+            return _resp(200, {"lists": [{"listId": "l-1"}], "hasMore": True, "offset": 100})
+        assert body["offset"] == 100
+        return _resp(200, {"lists": [{"listId": "l-2"}], "hasMore": False})
+
+    fake = _FakeAsyncClient(post_handlers={"/crm/v3/lists/search": search_handler})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["OBJECT_LIST"])
+
+    assert result["OBJECT_LIST"] == [{"listId": "l-1"}, {"listId": "l-2"}]
+
+
+@pytest.mark.asyncio
+async def test_object_list_treats_429_from_the_post_search_as_pull_failed():
+    fake = _FakeAsyncClient(post_handlers={"/crm/v3/lists/search": lambda body: _resp(429, {})})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_crm_objects(client=fake, headers={}, object_types=["OBJECT_LIST"])
+
+    assert result["OBJECT_LIST"] == {"error": "pull_failed"}
+
+
+# --- pull_object / list_read_only_tools: fixed capability dispatch ---
+
+
+@pytest.mark.asyncio
+async def test_list_read_only_tools_returns_the_fixed_capability_set():
+    client = HubSpotDataPullClient("hub_a")
+    tools = await client.list_read_only_tools()
+
+    assert set(tools) == {
+        "owners",
+        "organization_details",
+        "content_analytics",
+        "marketing_email_analytics",
+        "campaign_attribution",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pull_object_refuses_unrecognized_capability_name():
     client = HubSpotDataPullClient("hub_a")
 
     with pytest.raises(ReadOnlyViolation):
@@ -137,98 +354,294 @@ async def test_pull_object_refuses_write_shaped_tool(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pull_object_refuses_unrecognized_tool_with_no_read_verb(monkeypatch):
-    """Same guard, the actual tickets-scope scenario: a name with no
-    recognized write verb either must still be refused, not called on the
-    assumption that "not obviously a write" means "safe to call"."""
-    _patch_client(monkeypatch, ["close_ticket"], {}, {})
+async def test_pull_object_degrades_to_pull_failed_instead_of_raising():
+    # Previously pull_object had no except (try/finally only), so a real
+    # HubSpot error here propagated uncaught — the one leaf pull method in
+    # this file without the "never crash, just degrade" guarantee every
+    # sibling method has. A caller that doesn't independently wrap this
+    # call (gateway/debug_api.py's pull_capability route) got an
+    # unhandled 500 instead of a graceful {"error": "pull_failed"}.
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/owners/": lambda params: _resp(403, {})})
     client = HubSpotDataPullClient("hub_a")
 
-    with pytest.raises(ReadOnlyViolation):
-        await client.pull_object("close_ticket")
+    result = await client.pull_object("owners", client=fake, headers={})
+
+    assert result == {"error": "pull_failed"}
 
 
 @pytest.mark.asyncio
-async def test_pull_all_produces_snapshot_of_in_scope_objects(monkeypatch):
-    tools = ["list_contacts", "list_deals"]
-    responses = {
-        "list_contacts": {"id": "contact-1", "email": "a@example.com"},
-        "list_deals": {"id": "deal-1", "amount": 100},
-    }
-    _patch_client(monkeypatch, tools, responses, {})
-
+async def test_pull_object_owners_calls_the_owners_endpoint():
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/owners/": lambda params: _page([{"id": "o-1"}])})
     client = HubSpotDataPullClient("hub_a")
-    result = await client.pull_all()
+    result = await client.pull_object("owners", client=fake, headers={})
 
-    assert result["list_contacts"] == {"id": "contact-1", "email": "a@example.com"}
-    assert result["list_deals"] == {"id": "deal-1", "amount": 100}
+    assert result == [{"id": "o-1"}]
 
 
 @pytest.mark.asyncio
-async def test_pull_uses_only_this_tenants_token_never_anothers(monkeypatch):
+async def test_pull_object_organization_details_composes_three_endpoints():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/settings/v3/users/teams": lambda params: _resp(200, {"results": [{"id": "team-1"}]}),
+            "/settings/v3/users/": lambda params: _resp(200, {"results": [{"id": "user-1"}]}),
+            "/account-info/v3/details": lambda params: _resp(200, {"portalId": 123}),
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_object("organization_details", client=fake, headers={})
+
+    assert result["teams"] == {"results": [{"id": "team-1"}]}
+    assert result["users"] == {"results": [{"id": "user-1"}]}
+    assert result["account"] == {"portalId": 123}
+
+
+@pytest.mark.asyncio
+async def test_pull_object_organization_details_degrades_per_endpoint_not_all_or_nothing():
+    # Confirmed live that /settings/v3/users/teams needs its own scope
+    # distinct from /settings/v3/users/ — a portal missing just that one
+    # scope previously lost all three endpoints' data, not just the one
+    # that actually failed.
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/settings/v3/users/teams": lambda params: _resp(403, {}),
+            "/settings/v3/users/": lambda params: _resp(200, {"results": [{"id": "user-1"}]}),
+            "/account-info/v3/details": lambda params: _resp(200, {"portalId": 123}),
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_object("organization_details", client=fake, headers={})
+
+    assert result["teams"] == {"error": "pull_failed"}
+    assert result["users"] == {"results": [{"id": "user-1"}]}
+    assert result["account"] == {"portalId": 123}
+
+
+@pytest.mark.asyncio
+async def test_pull_object_content_analytics_calls_analytics_endpoint():
+    fake = _FakeAsyncClient(get_handlers={"/analytics/v2/reports/pages/total": lambda params: _resp(200, {"totals": {}})})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_object("content_analytics", client=fake, headers={})
+
+    assert result == {"totals": {}}
+
+
+@pytest.mark.asyncio
+async def test_pull_object_marketing_email_analytics_calls_statistics_endpoint():
+    fake = _FakeAsyncClient(
+        get_handlers={"/marketing/v3/emails/statistics/list": lambda params: _resp(200, {"totals": []})}
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_object("marketing_email_analytics", client=fake, headers={})
+
+    assert result == {"totals": []}
+
+
+@pytest.mark.asyncio
+async def test_pull_object_campaign_attribution_wraps_pull_campaign_data():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/marketing/v3/campaigns": lambda params: _page([{"id": "cmp-1"}]),
+            "/marketing/v3/campaigns/cmp-1/reports/metrics": lambda params: _resp(200, {"revenue": 100}),
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_object("campaign_attribution", client=fake, headers={})
+
+    assert result == {"campaigns": [{"id": "cmp-1", "revenue": 100}]}
+
+
+# --- pull_campaign_data: enumerate then per-campaign metrics ---
+
+
+@pytest.mark.asyncio
+async def test_pull_campaign_data_enumerates_and_queries_each_campaign():
+    seen_metric_calls = []
+
+    def metrics_handler(campaign_id):
+        def handler(params):
+            seen_metric_calls.append(campaign_id)
+            return _resp(200, {"revenue": 10})
+
+        return handler
+
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/marketing/v3/campaigns": lambda params: _page([{"id": "111"}, {"id": "222"}]),
+            "/marketing/v3/campaigns/111/reports/metrics": metrics_handler("111"),
+            "/marketing/v3/campaigns/222/reports/metrics": metrics_handler("222"),
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_campaign_data(client=fake, headers={})
+
+    assert {record["id"] for record in result} == {"111", "222"}
+    assert set(seen_metric_calls) == {"111", "222"}
+
+
+@pytest.mark.asyncio
+async def test_pull_campaign_data_returns_empty_when_campaign_list_fails():
+    def failing_list_handler(params):
+        raise RuntimeError("simulated CAMPAIGN access failure")
+
+    fake = _FakeAsyncClient(get_handlers={"/marketing/v3/campaigns": failing_list_handler})
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_campaign_data(client=fake, headers={})
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_pull_campaign_data_one_campaigns_metrics_failure_does_not_fail_others():
+    def metrics_handler(params):
+        raise RuntimeError("simulated failure for this campaign only")
+
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/marketing/v3/campaigns": lambda params: _page([{"id": "111"}, {"id": "222"}]),
+            "/marketing/v3/campaigns/111/reports/metrics": metrics_handler,
+            "/marketing/v3/campaigns/222/reports/metrics": lambda params: _resp(200, {"revenue": 5}),
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_campaign_data(client=fake, headers={})
+
+    by_id = {record["id"]: record for record in result}
+    assert by_id["111"] == {"id": "111", "error": "pull_failed"}
+    assert by_id["222"]["revenue"] == 5
+
+
+# --- custom property discovery: /crm/v3/properties/{slug} ---
+
+
+@pytest.mark.asyncio
+async def test_discover_object_property_definitions_returns_name_and_hubspot_defined():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/properties/contacts": lambda params: _resp(
+                200,
+                {
+                    "results": [
+                        {"name": "email", "hubspotDefined": True},
+                        {"name": "custom_lead_score", "hubspotDefined": False},
+                    ]
+                },
+            )
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    definitions = await client.discover_object_property_definitions("CONTACT", client=fake, headers={})
+
+    assert definitions == [
+        {"name": "email", "hubspotDefined": True},
+        {"name": "custom_lead_score", "hubspotDefined": False},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discover_object_properties_returns_just_names():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/properties/contacts": lambda params: _resp(
+                200, {"results": [{"name": "email", "hubspotDefined": True}]}
+            )
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    names = await client.discover_object_properties("CONTACT", client=fake, headers={})
+
+    assert names == ["email"]
+
+
+@pytest.mark.asyncio
+async def test_discover_object_property_definitions_filters_unsafe_names_defensively():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/properties/contacts": lambda params: _resp(
+                200,
+                {
+                    "results": [
+                        {"name": "email", "hubspotDefined": True},
+                        {"name": "bad; name", "hubspotDefined": False},
+                    ]
+                },
+            )
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    definitions = await client.discover_object_property_definitions("CONTACT", client=fake, headers={})
+
+    assert [d["name"] for d in definitions] == ["email"]
+
+
+@pytest.mark.asyncio
+async def test_discover_object_property_definitions_returns_empty_for_non_standard_type():
+    client = HubSpotDataPullClient("hub_a")
+    definitions = await client.discover_object_property_definitions("CAMPAIGN")
+
+    assert definitions == []
+
+
+@pytest.mark.asyncio
+async def test_discover_object_properties_only_uses_this_tenants_token(monkeypatch):
     token_log: dict[str, list[str]] = {}
-    _patch_client(monkeypatch, ["list_contacts"], {"list_contacts": {"id": "c-1"}}, token_log)
+
+    def factory(hub_id):
+        return _FakeAsyncClient(
+            get_handlers={"/crm/v3/properties/contacts": lambda params: _resp(200, {"results": []})}
+        )
+
+    _patch_client_for_hub(monkeypatch, factory, token_log)
 
     client_a = HubSpotDataPullClient("hub_a")
     client_b = HubSpotDataPullClient("hub_b")
+    await client_a.discover_object_properties("CONTACT")
+    await client_b.discover_object_properties("CONTACT")
 
-    await client_a.pull_all()
-    await client_b.pull_all()
+    _assert_tokens_never_cross(token_log)
 
-    # pull_all() now opens exactly one connection (and fetches the access
-    # token exactly once) for the whole pull — reused across tool
-    # discovery, every generic tool, every CRM_OBJECT_TYPES entry, and
-    # campaign enumeration — instead of one connection per tool/object
-    # call. What matters for isolation is that the one connection made for
-    # hub_a used only hub_a's token, and likewise for hub_b.
-    assert token_log["hub_a"] == ["access-token-for-hub_a"]
-    assert token_log["hub_b"] == ["access-token-for-hub_b"]
-    # Neither tenant's pull ever saw the other tenant's token.
-    assert "access-token-for-hub_b" not in token_log["hub_a"]
-    assert "access-token-for-hub_a" not in token_log["hub_b"]
+
+# --- pull_all: the scheduled job's full-snapshot entry point ---
 
 
 @pytest.mark.asyncio
-async def test_pull_failure_for_one_tool_does_not_leak_into_others(monkeypatch):
-    class _FailingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            if name == "list_contacts":
-                raise RuntimeError("simulated upstream failure")
-            return await super().call_tool(name, params)
+async def test_pull_all_produces_snapshot_of_generic_capabilities_crm_objects_and_campaign_data(monkeypatch):
+    def factory(hub_id):
+        get_handlers = {
+            "/crm/v3/owners/": lambda params: _page([{"id": "o-1"}]),
+            "/settings/v3/users/teams": lambda params: _resp(200, {}),
+            "/settings/v3/users/": lambda params: _resp(200, {}),
+            "/account-info/v3/details": lambda params: _resp(200, {}),
+            "/analytics/v2/reports/pages/total": lambda params: _resp(200, {}),
+            "/marketing/v3/emails/statistics/list": lambda params: _resp(200, {}),
+            "/marketing/v3/campaigns": lambda params: _page([]),
+            "/cms/v3/pages/landing-pages": lambda params: _page([]),
+            "/cms/v3/blogs/posts": lambda params: _page([]),
+        }
+        post_handlers = {"/crm/v3/lists/search": lambda body: _resp(200, {"lists": []})}
+        for slug in hubspot_client.CRM_OBJECT_REST_SLUGS.values():
+            get_handlers[f"/crm/v3/objects/{slug}"] = lambda params: _page([])
+        return _FakeAsyncClient(get_handlers=get_handlers, post_handlers=post_handlers)
 
-    async def fake_client(self, access_token):
-        return _FailingMCPClient(["list_contacts", "list_deals"], {"list_deals": {"id": "deal-1"}})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
+    _patch_client_for_hub(monkeypatch, factory)
 
     client = HubSpotDataPullClient("hub_a")
     result = await client.pull_all()
 
-    assert result["list_contacts"] == {"error": "pull_failed"}
-    assert result["list_deals"] == {"id": "deal-1"}
+    assert result["owners"] == [{"id": "o-1"}]
+    assert set(hubspot_client.CRM_OBJECT_TYPES) <= set(result.keys())
+    assert "campaign_data" in result
+    # campaign_attribution is excluded from pull_all()'s own generic loop —
+    # it's just pull_campaign_data() wrapped, and "campaign_data" above
+    # already covers that ground; see pull_all()'s own comment.
+    assert "campaign_attribution" not in result
 
 
 @pytest.mark.asyncio
-async def test_pull_all_degrades_gracefully_when_mcp_auth_not_installed(monkeypatch):
-    """A tenant that completed only the Public App install has no mcp_tokens
-    row yet (a valid, documented interim state — see
-    context/ONBOARDING_RUNBOOK.md). get_access_token raises HTTPException
-    404 for it; pull_all() must catch that itself and log it as a
-    hubspot_pull.tool_failed event (the same event name every other
-    per-tool failure uses, and the one operators are told to check), not
-    let it propagate uncaught into the scheduled job's generic
-    cycle-level failure handler."""
-    from fastapi import HTTPException
+async def test_pull_all_degrades_gracefully_when_token_fetch_fails(monkeypatch):
+    async def fake_client_for_hub(self):
+        raise RuntimeError("no vaulted token for this tenant")
 
-    async def fake_get_access_token(hub_id):
-        raise HTTPException(404, "Unknown tenant")
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
 
     client = HubSpotDataPullClient("hub_a")
     result = await client.pull_all()
@@ -236,440 +649,285 @@ async def test_pull_all_degrades_gracefully_when_mcp_auth_not_installed(monkeypa
     assert result == {"error": "pull_failed"}
 
 
-# query_crm_data: the confirmed-real, only-real-way to read the core CRM
-# object set (contacts, companies, deals, tickets, etc.) — see this
-# module's docstring for why it can't go through the name-based filter
-# above, and why _is_safe_select exists as defense in depth even though
-# pull_crm_objects() only ever authors the SQL itself.
-
-
-def test_is_safe_select_accepts_plain_select():
-    assert hubspot_client._is_safe_select("SELECT * FROM CONTACT") is True
-    assert hubspot_client._is_safe_select("select * from deal;") is True
-    assert hubspot_client._is_safe_select(
-        "SELECT hubspot_owner_id, SUM(amount_in_home_currency) FROM DEAL GROUP BY hubspot_owner_id"
-    ) is True
-
-
-def test_is_safe_select_rejects_non_select_statements():
-    assert hubspot_client._is_safe_select("UPDATE contact SET firstname = 'x'") is False
-    assert hubspot_client._is_safe_select("INSERT INTO contact (firstname) VALUES ('x')") is False
-    assert hubspot_client._is_safe_select("DELETE FROM deal") is False
-    assert hubspot_client._is_safe_select("DROP TABLE contact") is False
-
-
-def test_is_safe_select_rejects_stacked_statements():
-    """The actual injection shape this guard exists for: a query that
-    starts with a plain SELECT (passing a naive prefix check) but smuggles
-    a mutating statement after a semicolon."""
-    assert hubspot_client._is_safe_select("SELECT * FROM CONTACT; DROP TABLE contact") is False
-    assert hubspot_client._is_safe_select("SELECT * FROM CONTACT; DELETE FROM contact;") is False
-
-
-def test_is_safe_select_rejects_write_keyword_anywhere_in_statement():
-    # Not just a prefix check: a write-shaped clause later in an otherwise
-    # SELECT-prefixed statement must still be refused.
-    assert hubspot_client._is_safe_select("SELECT * FROM CONTACT WHERE update = 'x'") is False
-
-
-def test_is_safe_select_accepts_bare_set_and_into_as_ordinary_words():
-    # "set"/"into" are only meaningful as part of UPDATE...SET / INSERT
-    # INTO, and those parent keywords are already blocked above — a bare
-    # occurrence (a property name, an alias, a literal) must not
-    # false-positive-reject an otherwise-safe SELECT.
-    assert hubspot_client._is_safe_select(
-        "SELECT job_offer_set FROM CONTACT WHERE description = 'a mind set'"
-    ) is True
-    assert hubspot_client._is_safe_select(
-        "SELECT sales_into_the_future FROM DEAL"
-    ) is True
-
-
 @pytest.mark.asyncio
-async def test_pull_object_refuses_query_crm_data_with_non_select_sql(monkeypatch):
-    _patch_client(monkeypatch, ["query_crm_data"], {}, {})
-    client = HubSpotDataPullClient("hub_a")
+async def test_pull_crm_objects_degrades_gracefully_when_token_fetch_fails(monkeypatch):
+    # Previously only pull_all() wrapped its own _client_for_hub() call in
+    # a try/except — pull_crm_objects (called directly by
+    # gateway/debug_api.py's /crm/{object_type} route, not through
+    # pull_all()) had no such guard and raised uncaught.
+    async def fake_client_for_hub(self):
+        raise RuntimeError("no vaulted token for this tenant")
 
-    with pytest.raises(ReadOnlyViolation):
-        await client.pull_object("query_crm_data", sql="DELETE FROM contact")
-
-
-@pytest.mark.asyncio
-async def test_pull_object_allows_query_crm_data_with_plain_select(monkeypatch):
-    _patch_client(
-        monkeypatch,
-        ["query_crm_data"],
-        {"query_crm_data": {"id": "contact-1"}},
-        {},
-    )
-    client = HubSpotDataPullClient("hub_a")
-
-    result = await client.pull_object("query_crm_data", sql="SELECT * FROM CONTACT")
-
-    assert result == {"id": "contact-1"}
-
-
-# _extract_result / _unwrap_query_crm_data: regression tests locking in
-# the exact real response shapes confirmed live against mcp.hubspot.com.
-# None of HubSpot's real tools declare an outputSchema, so FastMCP's
-# result.data/.structured_content are always None in production — the
-# real payload is JSON text inside result.content[0].text instead. The
-# _FakeMCPClient/_FakeResult used elsewhere in this file set .data
-# directly and so never exercise this fallback path; these tests use a
-# bare object shaped like the real CallToolResult instead.
-
-
-def _content_result(text):
-    return SimpleNamespace(data=None, structured_content=None, content=[SimpleNamespace(text=text)])
-
-
-def test_extract_result_falls_back_to_content_when_data_is_none():
-    # Confirmed live: search_owners' real response.
-    real_payload = {"owners": [{"ownerId": 1, "name": "A", "isActive": True}], "hasMore": False}
-    result = _content_result(json.dumps(real_payload))
-
-    assert hubspot_client._extract_result(result) == real_payload
-
-
-def test_extract_result_prefers_data_when_present():
-    result = SimpleNamespace(data={"already": "structured"}, content=None)
-    assert hubspot_client._extract_result(result) == {"already": "structured"}
-
-
-def test_unwrap_query_crm_data_flattens_citation_envelope():
-    # Confirmed live: query_crm_data's real response for "SELECT * FROM
-    # CONTACT" against the test portal — each record is double-encoded
-    # (a JSON string inside the "content" field of each "results" entry),
-    # with a non-data "instructions" field mixed in alongside it.
-    envelope = {
-        "results": [
-            {"content": json.dumps({"objectTypeId": "0-1", "properties": {"firstname": "Brian"}})},
-            {"content": json.dumps({"objectTypeId": "0-1", "properties": {"firstname": "Maria"}})},
-        ],
-        "instructions": "If response contains citations...",
-    }
-
-    records = hubspot_client._unwrap_query_crm_data(envelope)
-
-    assert records == [
-        {"objectTypeId": "0-1", "properties": {"firstname": "Brian"}},
-        {"objectTypeId": "0-1", "properties": {"firstname": "Maria"}},
-    ]
-
-
-def test_unwrap_query_crm_data_leaves_non_envelope_values_unchanged():
-    # Guards against ever assuming every tool response looks like
-    # query_crm_data's envelope — this is only applied when tool_name is
-    # in _SQL_QUERY_TOOLS, and even then should no-op on an unexpected shape
-    # rather than raise or silently drop data.
-    assert hubspot_client._unwrap_query_crm_data({"owners": []}) == {"owners": []}
-    assert hubspot_client._unwrap_query_crm_data(None) is None
-
-
-@pytest.mark.asyncio
-async def test_pull_crm_objects_queries_every_confirmed_object_type(monkeypatch):
-    seen_sql: list[str] = []
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            seen_sql.append(params["sql"])
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["query_crm_data"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
 
     client = HubSpotDataPullClient("hub_a")
     result = await client.pull_crm_objects()
 
-    assert set(result.keys()) == set(hubspot_client.CRM_OBJECT_TYPES)
-    for object_type in hubspot_client.CRM_OBJECT_TYPES:
-        assert f"SELECT hs_object_id, * FROM {object_type}" in seen_sql
+    assert result == {"error": "pull_failed"}
+
+
+@pytest.mark.asyncio
+async def test_pull_campaign_data_degrades_gracefully_when_token_fetch_fails(monkeypatch):
+    async def fake_client_for_hub(self):
+        raise RuntimeError("no vaulted token for this tenant")
+
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
+
+    client = HubSpotDataPullClient("hub_a")
+    result = await client.pull_campaign_data()
+
+    assert result == []
+
+
+# --- constants: coverage discipline unchanged by the REST pivot ---
 
 
 def test_crm_object_types_covers_segments_landing_pages_and_blog_posts():
-    # Confirmed live via query_crm_data against the real endpoint: these
-    # three are plain queryable object types, the same mechanism as every
-    # other entry, resolving what were earlier thought to be gaps (spec's
-    # "segments"/"landing pages"/"blog posts" reference objects).
     assert "OBJECT_LIST" in hubspot_client.CRM_OBJECT_TYPES
     assert "LANDING_PAGE" in hubspot_client.CRM_OBJECT_TYPES
     assert "BLOG_POST" in hubspot_client.CRM_OBJECT_TYPES
-
-
-def test_crm_object_aliases_cover_every_object_type():
-    # A new CRM_OBJECT_TYPES entry with no matching CRM_OBJECT_ALIASES
-    # entry would silently never match any free-text query in
-    # session/live_session.py's query_hubspot_data — the same class of
-    # silent-drop bug that made "companies"/"meetings" unmatchable before
-    # this alias table existed. Caught here at test time, not discovered
-    # by a staff member getting an empty result with no error.
-    assert set(hubspot_client.CRM_OBJECT_ALIASES.keys()) == set(hubspot_client.CRM_OBJECT_TYPES)
-    for object_type, aliases in hubspot_client.CRM_OBJECT_ALIASES.items():
-        assert aliases, f"{object_type} has no query aliases"
-
-
-def test_crm_object_aliases_match_common_irregular_plurals():
-    # The specific failure this alias table exists to fix: naive substring
-    # matching against the bare type name misses these.
-    assert "companies" in hubspot_client.CRM_OBJECT_ALIASES["COMPANY"]
-    assert "meetings" in hubspot_client.CRM_OBJECT_ALIASES["MEETING_EVENT"]
-    assert "landing pages" in hubspot_client.CRM_OBJECT_ALIASES["LANDING_PAGE"]
-    assert "blog posts" in hubspot_client.CRM_OBJECT_ALIASES["BLOG_POST"]
-
-
-# list_read_only_tools()'s out-of-scope branch: a tool can be read-safe
-# (matches a read verb, no write verb) but not match any in-scope object
-# keyword. This used to be silently dropped with no logging at all — which
-# is exactly how get_organization_details (the real path to the spec's
-# "teams" object) went unnoticed. Now it's a distinct, logged bucket.
-
-
-def test_is_in_scope_matches_organization_for_get_organization_details():
-    assert hubspot_client._is_in_scope("get_organization_details") is True
-
-
-@pytest.mark.asyncio
-async def test_list_read_only_tools_includes_get_organization_details(monkeypatch):
-    tools = ["get_organization_details", "search_conversations"]
-    _patch_client(monkeypatch, tools, {}, {})
-
-    client = HubSpotDataPullClient("hub_a")
-    selected = await client.list_read_only_tools()
-
-    assert "get_organization_details" in selected
-    # Read-safe (matches "search") but not in scope (no spec object
-    # keyword matches) — excluded, but via the dedicated out-of-scope
-    # bucket, not silently.
-    assert "search_conversations" not in selected
-
-
-# _DEFAULT_TOOL_PARAMS: get_content_analytics_report and
-# get_marketing_email_analytics both have a genuinely required field their
-# schema rejects an empty call without, confirmed live with real HubSpot
-# responses (not "Not Authorized"/schema-validation errors). pull_all()
-# supplies these automatically; get_campaign_attribution_reports and
-# read_campaign_data are deliberately NOT here (see the module's own
-# comment on _DEFAULT_TOOL_PARAMS for why).
-
-
-@pytest.mark.asyncio
-async def test_pull_all_supplies_default_params_for_content_analytics(monkeypatch):
-    seen_params = {}
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            seen_params[name] = params
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["get_content_analytics_report"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    client = HubSpotDataPullClient("hub_a")
-    await client.pull_all()
-
-    assert seen_params["get_content_analytics_report"] == {"mode": "TOTALS"}
-
-
-@pytest.mark.asyncio
-async def test_pull_all_supplies_default_params_for_marketing_email_analytics(monkeypatch):
-    seen_params = {}
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            seen_params[name] = params
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["get_marketing_email_analytics"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    client = HubSpotDataPullClient("hub_a")
-    await client.pull_all()
-
-    mode = seen_params["get_marketing_email_analytics"]["mode"]
-    assert mode["_type"] == "OVERVIEW"
-    assert "startDate" in mode["statisticsSection"]
-    assert "endDate" in mode["statisticsSection"]
-
-
-@pytest.mark.asyncio
-async def test_pull_all_passes_no_default_params_for_unlisted_tools(monkeypatch):
-    seen_params = {}
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            seen_params[name] = params
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["search_owners"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    client = HubSpotDataPullClient("hub_a")
-    await client.pull_all()
-
-    assert seen_params["search_owners"] == {}
-
-
-# get_campaign_attribution_reports / read_campaign_data: confirmed live
-# against a real Enterprise-tier test account with a real campaign (see
-# design.md's decision log) — both work once called correctly, unlike the
-# earlier "Not Authorized"/account-tier-gated finding on a test account
-# without Campaigns enabled.
 
 
 def test_crm_object_types_covers_campaign():
     assert "CAMPAIGN" in hubspot_client.CRM_OBJECT_TYPES
 
 
-@pytest.mark.asyncio
-async def test_pull_all_supplies_default_params_for_campaign_attribution_reports(monkeypatch):
-    seen_params = {}
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            seen_params[name] = params
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["get_campaign_attribution_reports"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    client = HubSpotDataPullClient("hub_a")
-    await client.pull_all()
-
-    params = seen_params["get_campaign_attribution_reports"]
-    assert params["metrics"] == ["REVENUE", "DEAL_COUNT"]
-    assert params["hasReadToolInstructions"] is True
+def test_every_standard_crm_object_type_has_a_rest_slug():
+    # The four non-standard types (CAMPAIGN, LANDING_PAGE, BLOG_POST,
+    # OBJECT_LIST) deliberately have no entry here — they route to their
+    # own adapters instead of the generic /crm/v3/objects/ path.
+    standard_types = set(hubspot_client.CRM_OBJECT_TYPES) - hubspot_client._NON_STANDARD_OBJECT_TYPES
+    assert set(hubspot_client.CRM_OBJECT_REST_SLUGS.keys()) == standard_types
 
 
-@pytest.mark.asyncio
-async def test_pull_all_never_calls_read_campaign_data_with_no_params(monkeypatch):
-    """read_campaign_data's name passes the generic read-verb/in-scope
-    filter (matches "read" + "campaign"), so without the _PER_ITEM_TOOLS
-    exclusion it would be called bare by the generic loop and always fail
-    — every operation requires a real campaignCrmObjectId."""
-    seen_params = {}
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            seen_params.setdefault(name, []).append(params)
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["read_campaign_data"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    client = HubSpotDataPullClient("hub_a")
-    result = await client.pull_all()
-
-    assert "read_campaign_data" not in seen_params
-    assert "read_campaign_data" not in result
-
-
-@pytest.mark.asyncio
-async def test_pull_campaign_data_enumerates_and_queries_each_campaign(monkeypatch):
-    seen_read_campaign_calls = []
-
-    class _RecordingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            if name == "query_crm_data":
-                return _FakeResult(
-                    {
-                        "results": [
-                            {"content": json.dumps({"properties": {"hs_object_id": "111"}})},
-                            {"content": json.dumps({"properties": {"hs_object_id": "222"}})},
-                        ]
-                    }
-                )
-            if name == "read_campaign_data":
-                seen_read_campaign_calls.append(params)
-                return _FakeResult({"analyticsResponse": {"responses": []}})
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _RecordingMCPClient(["query_crm_data", "read_campaign_data"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
-    client = HubSpotDataPullClient("hub_a")
-    result = await client.pull_campaign_data()
-
-    # A list of per-campaign records, each carrying its own "id" — the
-    # same shape every other object type is staged in, not a dict keyed by
-    # campaign ID (see airtable_staging.stage_tenant_pull).
-    assert {record["id"] for record in result} == {"111", "222"}
-    called_ids = {
-        c["analyticsRequest"]["requests"][0]["campaignCrmObjectId"] for c in seen_read_campaign_calls
+def test_object_type_categories_cover_every_crm_object_type_exactly_once():
+    assert set(hubspot_client.OBJECT_TYPE_CATEGORIES.keys()) == set(hubspot_client.CRM_OBJECT_TYPES)
+    valid_categories = {
+        hubspot_client.CATEGORY_CRM_RECORDS,
+        hubspot_client.CATEGORY_ENGAGEMENT_RECORDS,
+        hubspot_client.CATEGORY_MARKETING_CONTENT,
+        hubspot_client.CATEGORY_USERS,
     }
-    assert called_ids == {111, 222}
-    for call in seen_read_campaign_calls:
-        assert call["operation"] == "GET_ANALYTICS"
-        assert call["analyticsRequest"]["requests"][0]["requestedData"] == "METRICS"
+    assert set(hubspot_client.OBJECT_TYPE_CATEGORIES.values()) <= valid_categories
+
+
+def test_crm_object_aliases_cover_every_object_type():
+    assert set(hubspot_client.CRM_OBJECT_ALIASES.keys()) == set(hubspot_client.CRM_OBJECT_TYPES)
+    for object_type, aliases in hubspot_client.CRM_OBJECT_ALIASES.items():
+        assert aliases, f"{object_type} has no query aliases"
+
+
+def test_crm_object_aliases_match_common_irregular_plurals():
+    assert "companies" in hubspot_client.CRM_OBJECT_ALIASES["COMPANY"]
+    assert "meetings" in hubspot_client.CRM_OBJECT_ALIASES["MEETING_EVENT"]
+    assert "landing pages" in hubspot_client.CRM_OBJECT_ALIASES["LANDING_PAGE"]
+    assert "blog posts" in hubspot_client.CRM_OBJECT_ALIASES["BLOG_POST"]
+
+
+def test_category_generic_capabilities_only_names_real_capabilities():
+    all_named = {name for names in hubspot_client.CATEGORY_GENERIC_CAPABILITIES.values() for name in names}
+    assert all_named <= set(hubspot_client._GENERIC_CAPABILITIES.keys())
+
+
+def test_is_safe_property_name_accepts_plain_identifiers():
+    assert hubspot_client._is_safe_property_name("custom_deal_score") is True
+    assert hubspot_client._is_safe_property_name("hs_object_id") is True
+
+
+def test_is_safe_property_name_rejects_unsafe_characters():
+    assert hubspot_client._is_safe_property_name("bad; DROP TABLE x") is False
+    assert hubspot_client._is_safe_property_name("bad name") is False
+    assert hubspot_client._is_safe_property_name("bad-name") is False
+    assert hubspot_client._is_safe_property_name("1_leading_digit") is False
 
 
 @pytest.mark.asyncio
-async def test_pull_campaign_data_returns_empty_when_campaign_query_fails(monkeypatch):
-    class _FailingMCPClient(_FakeMCPClient):
-        async def call_tool(self, name, params):
-            if name == "query_crm_data":
-                raise RuntimeError("simulated CAMPAIGN access failure")
-            return await super().call_tool(name, params)
-
-    async def fake_client(self, access_token):
-        return _FailingMCPClient(["query_crm_data"], {})
-
-    monkeypatch.setattr(HubSpotDataPullClient, "_client", fake_client)
-
-    async def fake_get_access_token(hub_id):
-        return "token"
-
-    monkeypatch.setattr(hubspot_client.mcp_vault, "get_access_token", fake_get_access_token)
-
+async def test_rate_limited_paginate_raises_hubspot_rate_limited_directly():
+    """_paginate itself, not wrapped by pull_crm_objects' own try/except —
+    proves the 429 signal is real and distinguishable, not silently
+    swallowed at the lowest layer (pull_crm_objects' own outer catch is
+    what turns this into {"error": "pull_failed"} for callers, tested
+    above)."""
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/owners/": lambda params: _resp(429, {})})
     client = HubSpotDataPullClient("hub_a")
-    result = await client.pull_campaign_data()
 
-    assert result == []
+    with pytest.raises(HubSpotRateLimited):
+        await client._paginate(fake, {}, "/crm/v3/owners/", {})
+
+
+# --- custom objects (openspec/changes/custom-object-support): runtime-
+# discovered objectTypeId, never a fixed CRM_OBJECT_REST_SLUGS-style lookup ---
+
+
+def test_is_safe_object_type_id_accepts_the_real_shape():
+    assert hubspot_client._is_safe_object_type_id("2-3465404") is True
+
+
+def test_is_safe_object_type_id_rejects_unsafe_input():
+    assert hubspot_client._is_safe_object_type_id("2-3465404; DROP TABLE x") is False
+    assert hubspot_client._is_safe_object_type_id("not_an_id") is False
+    assert hubspot_client._is_safe_object_type_id("") is False
+
+
+@pytest.mark.asyncio
+async def test_discover_custom_object_schemas_returns_real_schemas():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": lambda params: _resp(
+                200,
+                {
+                    "results": [
+                        {
+                            "objectTypeId": "2-3465404",
+                            "name": "transaction",
+                            "labels": {"singular": "Transaction", "plural": "Transactions"},
+                        }
+                    ]
+                },
+            )
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    schemas = await client.discover_custom_object_schemas(client=fake, headers={})
+
+    assert schemas == [
+        {"objectTypeId": "2-3465404", "name": "transaction", "labels": {"singular": "Transaction", "plural": "Transactions"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discover_custom_object_schemas_filters_unsafe_object_type_ids_defensively():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": lambda params: _resp(
+                200,
+                {
+                    "results": [
+                        {"objectTypeId": "2-3465404", "name": "transaction", "labels": {}},
+                        {"objectTypeId": "bad; id", "name": "evil", "labels": {}},
+                    ]
+                },
+            )
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+    schemas = await client.discover_custom_object_schemas(client=fake, headers={})
+
+    assert [s["objectTypeId"] for s in schemas] == ["2-3465404"]
+
+
+@pytest.mark.asyncio
+async def test_discover_custom_object_schemas_degrades_gracefully_without_custom_objects_access():
+    fake = _FakeAsyncClient(get_handlers={"/crm-object-schemas/v3/schemas": lambda params: _resp(403, {})})
+    client = HubSpotDataPullClient("hub_a")
+
+    schemas = await client.discover_custom_object_schemas(client=fake, headers={})
+
+    assert schemas == []
+
+
+@pytest.mark.asyncio
+async def test_discover_custom_object_schemas_only_uses_this_tenants_token(monkeypatch):
+    token_log: dict[str, list[str]] = {}
+
+    def factory(hub_id):
+        return _FakeAsyncClient(get_handlers={"/crm-object-schemas/v3/schemas": lambda params: _page([])})
+
+    _patch_client_for_hub(monkeypatch, factory, token_log)
+
+    client_a = HubSpotDataPullClient("hub_a")
+    client_b = HubSpotDataPullClient("hub_b")
+    await client_a.discover_custom_object_schemas()
+    await client_b.discover_custom_object_schemas()
+
+    _assert_tokens_never_cross(token_log)
+
+
+@pytest.mark.asyncio
+async def test_pull_custom_object_returns_real_records():
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/2-3465404": lambda params: _page([{"id": "t-1"}])})
+    client = HubSpotDataPullClient("hub_a")
+
+    result = await client.pull_custom_object("2-3465404", client=fake, headers={})
+
+    assert result == [{"id": "t-1"}]
+
+
+@pytest.mark.asyncio
+async def test_pull_custom_object_forwards_explicit_properties():
+    seen_params = {}
+
+    def handler(params):
+        seen_params.update(params)
+        return _page([])
+
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/2-3465404": handler})
+    client = HubSpotDataPullClient("hub_a")
+
+    await client.pull_custom_object("2-3465404", client=fake, headers={}, properties=["status", "amount"])
+
+    assert seen_params["properties"] == "status,amount"
+
+
+@pytest.mark.asyncio
+async def test_pull_custom_object_rejects_unsafe_object_type_id_before_any_call():
+    client = HubSpotDataPullClient("hub_a")
+
+    result = await client.pull_custom_object("bad; id")
+
+    assert result == {"error": "pull_failed"}
+
+
+@pytest.mark.asyncio
+async def test_pull_custom_object_degrades_gracefully_on_failure():
+    def failing_handler(params):
+        raise RuntimeError("simulated failure")
+
+    fake = _FakeAsyncClient(get_handlers={"/crm/v3/objects/2-3465404": failing_handler})
+    client = HubSpotDataPullClient("hub_a")
+
+    result = await client.pull_custom_object("2-3465404", client=fake, headers={})
+
+    assert result == {"error": "pull_failed"}
+
+
+@pytest.mark.asyncio
+async def test_pull_custom_object_only_uses_this_tenants_token(monkeypatch):
+    token_log: dict[str, list[str]] = {}
+
+    def factory(hub_id):
+        return _FakeAsyncClient(get_handlers={"/crm/v3/objects/2-3465404": lambda params: _page([])})
+
+    _patch_client_for_hub(monkeypatch, factory, token_log)
+
+    client_a = HubSpotDataPullClient("hub_a")
+    client_b = HubSpotDataPullClient("hub_b")
+    await client_a.pull_custom_object("2-3465404")
+    await client_b.pull_custom_object("2-3465404")
+
+    _assert_tokens_never_cross(token_log)
+
+
+@pytest.mark.asyncio
+async def test_discover_custom_object_properties_returns_definitions():
+    fake = _FakeAsyncClient(
+        get_handlers={
+            "/crm/v3/properties/2-3465404": lambda params: _resp(
+                200, {"results": [{"name": "status", "hubspotDefined": False}]}
+            )
+        }
+    )
+    client = HubSpotDataPullClient("hub_a")
+
+    definitions = await client.discover_custom_object_properties("2-3465404", client=fake, headers={})
+
+    assert definitions == [{"name": "status", "hubspotDefined": False}]
+
+
+@pytest.mark.asyncio
+async def test_discover_custom_object_properties_rejects_unsafe_object_type_id():
+    client = HubSpotDataPullClient("hub_a")
+
+    definitions = await client.discover_custom_object_properties("bad; id")
+
+    assert definitions == []

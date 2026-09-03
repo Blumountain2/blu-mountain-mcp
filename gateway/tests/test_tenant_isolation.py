@@ -34,24 +34,6 @@ async def _seed_tenant(hub_id: str, expires_at: datetime):
     )
 
 
-async def _seed_mcp_tenant(hub_id: str, expires_at: datetime):
-    pool = await get_pool()
-    key = derive_tenant_key(hub_id)
-    await pool.execute(
-        "INSERT INTO tenants (hub_id) VALUES ($1) ON CONFLICT (hub_id) DO NOTHING", hub_id
-    )
-    await pool.execute(
-        """
-        INSERT INTO mcp_tokens (hub_id, encrypted_access_token, encrypted_refresh_token, expires_at)
-        VALUES ($1, $2, $3, $4)
-        """,
-        hub_id,
-        encrypt(f"mcp-access-{hub_id}", key),
-        encrypt(f"mcp-refresh-{hub_id}", key),
-        expires_at,
-    )
-
-
 async def _restrict(staff: str, hub_id: str):
     pool = await get_pool()
     await pool.execute(
@@ -103,100 +85,6 @@ async def test_concurrent_refresh_different_tenants_isolated(monkeypatch):
     assert token_x == "new-refresh-hub_x"
     assert token_y == "new-refresh-hub_y"
     assert token_x != token_y
-
-
-@pytest.mark.asyncio
-async def test_concurrent_refresh_same_tenant_via_mcp_vault_refreshes_once(monkeypatch):
-    """mcp_vault (the MCP Auth App's credential) must get the exact same
-    per-tenant serialization guarantee as the Public App's default vault —
-    this is the multi-tenant isolation proof for the second vaulted
-    credential, not just the first."""
-    from auth import mcp_auth
-
-    await _seed_mcp_tenant("hub_mcp_concurrent", datetime.now(timezone.utc) + timedelta(minutes=1))
-
-    new_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
-    refresh_mock = AsyncMock(return_value=("mcp-new-access", "mcp-new-refresh", new_expiry))
-    monkeypatch.setattr(mcp_auth, "refresh_token_pair", refresh_mock)
-
-    vault_a = token_vault._mcp_vault()
-    vault_b = token_vault._mcp_vault()
-    results = await asyncio.gather(
-        vault_a.get_access_token("hub_mcp_concurrent"),
-        vault_b.get_access_token("hub_mcp_concurrent"),
-    )
-
-    assert all(r == "mcp-new-access" for r in results)
-    assert refresh_mock.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_concurrent_refresh_different_tenants_via_mcp_vault_isolated(monkeypatch):
-    from auth import mcp_auth
-
-    await _seed_mcp_tenant("hub_mcp_x", datetime.now(timezone.utc) + timedelta(minutes=1))
-    await _seed_mcp_tenant("hub_mcp_y", datetime.now(timezone.utc) + timedelta(minutes=1))
-
-    new_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
-
-    async def fake_refresh(refresh_token: str):
-        return (f"new-{refresh_token}", f"newer-{refresh_token}", new_expiry)
-
-    monkeypatch.setattr(mcp_auth, "refresh_token_pair", fake_refresh)
-
-    vault = token_vault._mcp_vault()
-    token_x, token_y = await asyncio.gather(
-        vault.get_access_token("hub_mcp_x"),
-        vault.get_access_token("hub_mcp_y"),
-    )
-
-    assert token_x == "new-mcp-refresh-hub_mcp_x"
-    assert token_y == "new-mcp-refresh-hub_mcp_y"
-    assert token_x != token_y
-
-
-@pytest.mark.asyncio
-async def test_vault_and_mcp_vault_refresh_same_tenant_dont_block_each_other(monkeypatch):
-    """The two vaults are independent tables with no data dependency for
-    the same tenant — the advisory lock must be scoped per table, not just
-    per hub_id, or a Public App refresh and an MCP Auth App refresh for
-    the SAME tenant would serialize against each other for no reason. This
-    is a real deadlock risk if that scoping regresses: the mcp refresh
-    below only completes by releasing the event the (otherwise-independent)
-    public refresh is waiting on — if the two locks wrongly conflicted,
-    the mcp refresh could never even start until the public one finishes,
-    and the public one would then wait forever. asyncio.wait_for turns
-    that hang into a clean test failure instead of blocking the suite."""
-    from auth import mcp_auth
-
-    hub_id = "hub_both_vaults"
-    await _seed_tenant(hub_id, datetime.now(timezone.utc) + timedelta(minutes=1))
-    await _seed_mcp_tenant(hub_id, datetime.now(timezone.utc) + timedelta(minutes=1))
-
-    new_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
-    release_public_refresh = asyncio.Event()
-
-    async def slow_public_refresh(refresh_token):
-        await release_public_refresh.wait()
-        return ("public-access", "public-refresh", new_expiry)
-
-    async def fast_mcp_refresh(refresh_token):
-        release_public_refresh.set()
-        return ("mcp-access", "mcp-refresh", new_expiry)
-
-    monkeypatch.setattr(token_vault, "refresh_token_pair", slow_public_refresh)
-    monkeypatch.setattr(mcp_auth, "refresh_token_pair", fast_mcp_refresh)
-
-    public_token, mcp_token = await asyncio.wait_for(
-        asyncio.gather(
-            TokenVault().get_access_token(hub_id),
-            token_vault._mcp_vault().get_access_token(hub_id),
-        ),
-        timeout=5,
-    )
-
-    assert public_token == "public-access"
-    assert mcp_token == "mcp-access"
 
 
 @pytest.mark.asyncio

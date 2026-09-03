@@ -1,61 +1,45 @@
-"""Per-tenant client for HubSpot's remote MCP endpoint (mcp.hubspot.com).
+"""Per-tenant client for HubSpot's plain REST API (api.hubapi.com), using
+the Public App's own vaulted OAuth token (auth.vault) — never a second
+credential. Replaces the prior mcp.hubspot.com-based implementation
+(openspec/changes/hubspot-rest-api-pivot; see that change's design.md for
+the full reasoning behind the pivot).
 
-Connects with FastMCP as an MCP client, authenticated with that tenant's
-vaulted MCP Auth App access token (auth.mcp_vault, spec Section 4.1) — not
-the Public App's token used elsewhere in this project, since mcp.hubspot.com
-is its own OAuth resource server (confirmed via its RFC 9728/8414 metadata)
-and does not accept the Public App's CRM-scoped token. Reads only the
-in-scope, read-only object set.
+REST's endpoint set is fixed and documented by HubSpot ahead of time, so
+this module has no runtime tool-discovery/classification step the way the
+MCP-based version needed (no equivalent of list_tools()/_is_read_safe) —
+every endpoint this project calls is a hand-enumerated constant below,
+reviewed once, not discovered per call. This module only ever issues GET
+requests, except one narrowly-scoped, explicitly-flagged read-only POST
+(HubSpot's own Lists "search" endpoint takes filter criteria in the
+request body, a real-only operation despite the HTTP verb) — matching the
+read-only-absolute rule everywhere else in this project.
 
-Three distinct read paths, confirmed live against the real endpoint (see
-design.md's decision log):
-
-1. Generic per-object tools (e.g. analytics/reporting tools), discovered
-   dynamically via list_tools() rather than hardcoded, since HubSpot does
-   not publish a fixed tool-name contract. A tool is only ever called if
-   its name both looks read-safe (no recognized write verb) AND matches a
-   recognized read verb — the read-verb allowlist isn't a defensive extra,
-   it's load-bearing: this module authenticates with the MCP Auth App's
-   token (auth.mcp_vault), a separate credential from the Public App's
-   OAuth-scoped token (.env.example's HUBSPOT_SCOPES) — the MCP Auth App
-   has no per-object scope grant of its own to rely on at all, so this
-   dynamic filter is the only thing standing between "HubSpot published a
-   tool that matches our read/in-scope keywords" and an actual call. Some
-   of these need a fixed default parameter their own schema requires
-   (_DEFAULT_TOOL_PARAMS) — confirmed live, none of these tools need
-   anything caller-supplied, just a value this module always sends the
-   same way.
-2. The core CRM object set (contacts, companies, deals, tickets, etc.) has
-   no per-object tool at all — confirmed live, the only way to read any of
-   it is `query_crm_data`, one generic tool that takes a raw SQL-like
-   string. Tool-name filtering can't gate this one (the object type lives
-   in the SQL text, not the tool name), so it's handled entirely
-   separately by pull_crm_objects(): the SQL is always authored here, from
-   a fixed per-type template, never passed through from any caller, and is
-   still run through _is_safe_select() as defense in depth even though we
-   wrote it ourselves — the same "don't rely on scope alone" posture as
-   the read-verb allowlist above.
-3. Per-campaign metrics via read_campaign_data — unlike every tool above,
-   every one of its operations requires a specific campaignCrmObjectId, so
-   there's no single fixed default the way path 1's tools have. Handled
-   separately by pull_campaign_data(): enumerate real campaign IDs via
-   query_crm_data first, then call once per campaign.
+Several real API families, not one uniform dialect the way MCP's
+query_crm_data was — confirmed live during this change's own research:
+- Core CRM objects (contacts, companies, deals, etc.): `/crm/v3/objects/{type}`.
+- Custom/standard property discovery: `/crm/v3/properties/{type}`.
+- Campaigns: `/marketing/v3/campaigns` (its own object shape, its own
+  per-campaign metrics endpoint).
+- Landing pages / blog posts: HubSpot's CMS API.
+- Lists (segments): HubSpot's Lists API.
+- Owners, teams/account info: `/crm/v3/owners`, `/settings/v3/users*`,
+  `/account-info/v3/details`.
+- Marketing email analytics: `/marketing/v3/emails/statistics/list`.
+- Content analytics: `/analytics/v2/reports/...`.
 """
 
 import asyncio
-import json
 import re
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import structlog
-from fastmcp import Client
-from fastmcp.client.transports import StreamableHttpTransport
 
-from auth import mcp_vault
+from auth import vault
 
 logger = structlog.get_logger()
 
-HUBSPOT_MCP_URL = "https://mcp.hubspot.com"
+HUBSPOT_API_BASE = "https://api.hubapi.com"
 
 # Bounds pull_campaign_data()'s per-campaign concurrency — campaign count
 # varies per tenant and is unbounded, unlike CRM_OBJECT_TYPES's fixed,
@@ -65,46 +49,9 @@ HUBSPOT_MCP_URL = "https://mcp.hubspot.com"
 _MAX_CONCURRENT_CAMPAIGN_PULLS = 5
 
 # Core + reference object set from spec Section 4.4 / the confirmed grant.
-# "organization" is here specifically for get_organization_details (see
-# list_read_only_tools()) — its name mentions neither "team" nor "user",
-# but it's the only real path to the spec's "teams" reference object
-# (confirmed live: query_crm_data has no queryable TEAM type at all).
-IN_SCOPE_OBJECT_KEYWORDS = [
-    "contact",
-    "compan",
-    "deal",
-    "ticket",
-    "line_item",
-    "line item",
-    "product",
-    "call",
-    "email",
-    "meeting",
-    "note",
-    "task",
-    "user",
-    "team",
-    "owner",
-    "campaign",
-    "content",
-    "list",
-    "organization",
-]
-
-# The real, confirmed FROM-clause type names for query_crm_data (see
-# pull_crm_objects()), discovered live via discover_hubspot_schema's
-# GET_OBJECT_TYPES — not guessed from the spec's plain-English object
-# names, which don't all match (e.g. "meetings" is MEETING_EVENT, not
-# MEETING). Covers the spec's "landing pages" and "blog posts" too
-# (LANDING_PAGE, BLOG_POST) — both are plain queryable object types here,
-# the same mechanism as every other entry, not something that needed
-# HubSpot's separate, read/write-mixed manage_landing_page tool. CAMPAIGN
-# is included too — confirmed live against a real Enterprise-tier test
-# account (see pull_campaign_data() below for why campaign *metrics* need
-# a separate per-campaign path instead of a plain SELECT). "teams" is the
-# one spec object with no queryable type in this list at all — it's read
-# via the separate get_organization_details tool instead (see
-# IN_SCOPE_OBJECT_KEYWORDS above), not through query_crm_data.
+# Names kept identical to the prior MCP-based module so every downstream
+# caller (frameworks/, session/live_session.py, sync/airtable_staging.py)
+# needs no changes — only how each type is actually fetched changes below.
 CRM_OBJECT_TYPES = [
     "CONTACT",
     "COMPANY",
@@ -118,23 +65,56 @@ CRM_OBJECT_TYPES = [
     "NOTE",
     "TASK",
     "USER",
+    "QUOTE",
     "OBJECT_LIST",
     "LANDING_PAGE",
     "BLOG_POST",
     "CAMPAIGN",
 ]
 
+# The real REST path segment for each standard CRM object type — HubSpot's
+# well-documented v3 CRM Objects API plural-name convention
+# (`/crm/v3/objects/{slug}`). "users" is medium-confidence relative to the
+# others (contacts/companies/deals/etc. are extremely well-established;
+# the Users object's own REST access pattern is less uniformly documented)
+# — confirmed live in task 2.2, see openspec/changes/hubspot-rest-api-pivot.
+CRM_OBJECT_REST_SLUGS = {
+    "CONTACT": "contacts",
+    "COMPANY": "companies",
+    "DEAL": "deals",
+    "TICKET": "tickets",
+    "LINE_ITEM": "line_items",
+    "PRODUCT": "products",
+    "CALL": "calls",
+    "EMAIL": "emails",
+    "MEETING_EVENT": "meetings",
+    "NOTE": "notes",
+    "TASK": "tasks",
+    "USER": "users",
+    # Two frameworks (Services/Project, Transactional — Blu Mountain's own
+    # vertical documentation) name Quotes as a secondary Opportunity/
+    # Proposal-stage signal. Access is tiered/migration-state dependent
+    # (HubSpot is mid-migration off the legacy Quotes API toward Revenue
+    # Hub), similar to CAMPAIGN's own account-tier gate — confirmed via
+    # HubSpot's own docs, not yet confirmed live on either test portal.
+    # crm.objects.quotes.read is requested as an optional scope for
+    # exactly this reason (see HUBSPOT_OPTIONAL_SCOPES).
+    "QUOTE": "quotes",
+}
+
+# These four don't share the standard CRM Objects API shape at all — each
+# lives under its own API family (Marketing Campaigns, CMS, Lists) and is
+# handled by its own adapter method inside pull_crm_objects(), not the
+# generic /crm/v3/objects/ loop.
+_NON_STANDARD_OBJECT_TYPES = {"OBJECT_LIST", "LANDING_PAGE", "BLOG_POST", "CAMPAIGN"}
+
 # Natural-language query terms a caller (session/live_session.py's
-# query_hubspot_data) might use for each type, since CRM_OBJECT_TYPES
-# entries are code-facing constants, not what a staff member would type.
-# A naive substring check against the type name alone misses irregular
-# plurals ("companies" is not a substring of "COMPANY", nor vice versa —
-# the plural changes "y" to "ies", not just appends a letter) and
-# compound/underscored names ("meetings" vs "MEETING_EVENT", "landing
-# pages" vs "LANDING_PAGE"). Every CRM_OBJECT_TYPES entry must have an
-# entry here — see test_crm_object_aliases_cover_every_object_type, which
-# asserts that correspondence statically so a future new object type can't
-# silently go unmatched the way "companies"/"meetings" did.
+# category tools) might use for each type, since CRM_OBJECT_TYPES entries
+# are code-facing constants, not what a staff member would type. A naive
+# substring check against the type name alone misses irregular plurals
+# ("companies" is not a substring of "COMPANY") and compound/underscored
+# names ("meetings" vs "MEETING_EVENT"). Every CRM_OBJECT_TYPES entry must
+# have an entry here — see test_crm_object_aliases_cover_every_object_type.
 CRM_OBJECT_ALIASES = {
     "CONTACT": {"contact", "contacts"},
     "COMPANY": {"company", "companies", "compan"},
@@ -148,240 +128,90 @@ CRM_OBJECT_ALIASES = {
     "NOTE": {"note", "notes"},
     "TASK": {"task", "tasks"},
     "USER": {"user", "users"},
+    "QUOTE": {"quote", "quotes"},
     "OBJECT_LIST": {"list", "lists", "segment", "segments"},
     "LANDING_PAGE": {"landing_page", "landing_pages", "landing page", "landing pages"},
     "BLOG_POST": {"blog_post", "blog_posts", "blog post", "blog posts"},
     "CAMPAIGN": {"campaign", "campaigns"},
 }
 
-# "teams" has no CRM_OBJECT_TYPES entry at all — its only real path is the
-# generic tool get_organization_details (see IN_SCOPE_OBJECT_KEYWORDS's own
-# "organization" entry below). A free-text query for "team"/"teams" needs
-# translating to "organization" before matching against tool names, or it
-# never finds get_organization_details the same way IN_SCOPE_OBJECT_KEYWORDS
-# already does for the scheduled pull.
+# "teams" has no CRM_OBJECT_TYPES entry at all — its only real path is
+# the organization_details generic capability below. A free-text query
+# for "team"/"teams" needs translating to "organization" before matching
+# against generic capability names.
 GENERIC_TOOL_QUERY_ALIASES = {"team": "organization", "teams": "organization"}
 
-# query_crm_data (see pull_crm_objects()) is deliberately never in the
-# generic dynamic allowlist below: its tool name reveals neither the
-# object type (that's in the SQL text) nor read/write intent the way
-# "get_x"/"create_x" names do, so name-based filtering can't gate it
-# safely. _is_safe_select() is its own, SQL-text-level guard instead.
-_SQL_QUERY_TOOLS = {"query_crm_data"}
+# Category groupings (openspec/changes/separate-vertical-client-agents,
+# task 6.1): every CRM_OBJECT_TYPES entry maps to exactly one category, so
+# session/live_session.py's category-scoped tools never silently drop an
+# object type. Unchanged by the REST pivot.
+CATEGORY_CRM_RECORDS = "crm_records"
+CATEGORY_ENGAGEMENT_RECORDS = "engagement_records"
+CATEGORY_MARKETING_CONTENT = "marketing_content"
+CATEGORY_USERS = "users"
 
-# read_campaign_data's name passes the generic read-verb/in-scope checks
-# below just fine (matches "read" and "campaign"), but every one of its
-# operations requires a specific campaignCrmObjectId — there's no single
-# fixed default call the way the other generic tools have, so pull_all()
-# skips it here and pull_campaign_data() handles it separately: enumerate
-# real campaign IDs first, then call once per campaign. Public (no leading
-# underscore) so other callers of list_read_only_tools()/pull_object()
-# (e.g. session/live_session.py) can exclude it the same way, instead of
-# rediscovering "read_campaign_data needs special handling" independently.
-PER_ITEM_TOOLS = {"read_campaign_data"}
-
-# Deliberately broad: this is the sole enforcement point for the MCP Auth
-# App's token (it carries no OAuth scope of its own, unlike the Public
-# App's HUBSPOT_SCOPES), so a name containing a recognized read verb
-# ("get_and_send_email", "search_and_enroll_contacts") must still be
-# rejected if it also contains ANY of these — the read-verb allowlist
-# alone isn't enough once a name can carry both. Still a hand-curated
-# blocklist, not a provable-complete one, against an API this project
-# doesn't control: HubSpot could ship a tool whose write-shaped verb isn't
-# here yet. list_read_only_tools()'s logging is the backstop for a name
-# that gets EXCLUDED unexpectedly, but there is no equivalent backstop for
-# one that gets INCLUDED unexpectedly — treat any newly-selected tool name
-# as worth a human glance against HubSpot's real catalog before trusting
-# it, the same "confirmed live" standard this project holds everything
-# else to.
-_WRITE_VERBS = {
-    "create", "update", "upsert", "delete", "remove", "archive", "write",
-    "patch", "put", "merge", "enroll", "unenroll", "subscribe",
-    "unsubscribe", "send", "publish", "unpublish", "schedule", "cancel",
-    "restore", "move", "assign", "unassign", "close", "resolve", "reopen",
-    "associate", "disassociate", "share", "unshare", "revoke", "grant",
-    "execute", "run", "trigger", "dispatch", "clone", "duplicate", "import",
-    "rollback", "approve", "reject", "block", "unblock", "lock", "unlock",
-    "transfer", "convert", "split", "apply", "deactivate", "activate",
-    "enable", "disable", "reset", "push", "bulk",
+OBJECT_TYPE_CATEGORIES = {
+    "CONTACT": CATEGORY_CRM_RECORDS,
+    "COMPANY": CATEGORY_CRM_RECORDS,
+    "DEAL": CATEGORY_CRM_RECORDS,
+    "TICKET": CATEGORY_CRM_RECORDS,
+    "LINE_ITEM": CATEGORY_CRM_RECORDS,
+    "PRODUCT": CATEGORY_CRM_RECORDS,
+    "QUOTE": CATEGORY_CRM_RECORDS,
+    "CALL": CATEGORY_ENGAGEMENT_RECORDS,
+    "EMAIL": CATEGORY_ENGAGEMENT_RECORDS,
+    "MEETING_EVENT": CATEGORY_ENGAGEMENT_RECORDS,
+    "NOTE": CATEGORY_ENGAGEMENT_RECORDS,
+    "TASK": CATEGORY_ENGAGEMENT_RECORDS,
+    "CAMPAIGN": CATEGORY_MARKETING_CONTENT,
+    "LANDING_PAGE": CATEGORY_MARKETING_CONTENT,
+    "BLOG_POST": CATEGORY_MARKETING_CONTENT,
+    "OBJECT_LIST": CATEGORY_MARKETING_CONTENT,
+    "USER": CATEGORY_USERS,
 }
 
-# Blocks any SQL keyword that could mutate data, matched as a whole SQL
-# token (see _is_safe_select) so this can never be defeated by embedding
-# one of these words inside an identifier or string literal instead.
-# Deliberately excludes "call" despite being a plausible
-# stored-procedure-style keyword elsewhere: CALL is itself a real HubSpot
-# object type name (CRM_OBJECT_TYPES), and this dialect has no documented
-# procedure-call syntax to guard against in the first place. Also
-# deliberately excludes "into"/"set": both are only meaningful as part of
-# INSERT INTO / UPDATE ... SET, and those parent statement keywords are
-# already blocked below — "into"/"set" alone can't start a write statement
-# in this dialect, but they ARE common enough as bare English words or
-# identifier components (e.g. a "job_offer_set" property, a literal
-# containing "mind set") that keeping them here would false-positive-reject
-# a legitimate SELECT for no real safety gain.
-_SQL_WRITE_KEYWORDS = {
-    "insert", "update", "delete", "drop", "alter", "truncate", "merge",
-    "create", "grant", "revoke", "replace", "exec", "execute",
+# Generic (non-CRM-object) read capabilities this project implements via
+# REST, each its own adapter method below — the fixed, hand-maintained
+# replacement for the prior MCP-based dynamic tool discovery. Assigned to
+# exactly one category, same posture as CRM_OBJECT_TYPES.
+CATEGORY_GENERIC_CAPABILITIES = {
+    CATEGORY_USERS: {"owners", "organization_details"},
+    CATEGORY_MARKETING_CONTENT: {"content_analytics", "marketing_email_analytics", "campaign_attribution"},
+    CATEGORY_CRM_RECORDS: set(),
+    CATEGORY_ENGAGEMENT_RECORDS: set(),
 }
 
-# A tool name must contain one of these to be treated as read-safe. This is
-# deliberately an allowlist, not just the write-verb blocklist above: this
-# module's token (auth.mcp_vault, the MCP Auth App's credential) carries no
-# per-object scope grant at all, unlike the Public App's HUBSPOT_SCOPES, so
-# this function is the only enforcement of read-only for every tool it
-# calls, not a defensive extra on top of a scope that already refuses
-# writes. A blocklist alone fails open — an unrecognized tool name (e.g.
-# a hypothetical "notify_owner" or "flag_deal", containing no word in
-# _WRITE_VERBS and no read verb either) would slip through as "safe"
-# purely because nothing matched. Requiring a recognized read verb too
-# means an unrecognized name fails closed instead: it's excluded from
-# pull_all()'s results (less data) rather than risking a write going
-# through (a non-negotiable violation). See list_read_only_tools()'s
-# logging for whichever in-scope tools this excludes in practice, once
-# connected to HubSpot's real endpoint. This still doesn't catch a name
-# that has BOTH a recognized read verb and an unlisted write verb (e.g.
-# "get_and_send_email") — that's exactly what the broadened _WRITE_VERBS
-# above exists to close as much as a hand-curated list can.
-_READ_VERBS = {"get", "list", "search", "fetch", "find", "retrieve", "read", "describe"}
+_SAFE_PROPERTY_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
-def _marketing_email_overview_params() -> dict:
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=30)
-    return {
-        "mode": {
-            "_type": "OVERVIEW",
-            "statisticsSection": {
-                "startDate": start.isoformat(),
-                "endDate": end.isoformat(),
-                "frequency": "TOTAL",
-            },
-        }
-    }
+def _is_safe_property_name(name: str) -> bool:
+    """True only for a plain identifier. Defense in depth for the
+    `properties=` query param: these names already come from HubSpot's
+    own properties endpoint, never raw caller input, but the same "don't
+    trust scope/intent alone" posture this project has always held
+    applies here too."""
+    return bool(_SAFE_PROPERTY_NAME_RE.match(name))
 
 
-# get_campaign_attribution_reports's own schema lists no required fields,
-# but it runtime-rejects an empty call ("At least one metric is
-# required") and separately requires hasReadToolInstructions=true to skip
-# a one-time instructions round-trip aimed at an LLM caller reading them
-# fresh each session — not useful for this scheduled job, which always
-# sends the same fixed call, so it's set true unconditionally. Confirmed
-# live against a real Enterprise-tier test account with a real campaign:
-# on a portal where Campaigns isn't enabled at all (REQUIRES_ACCOUNT_
-# MODIFICATION, see design.md's decision log), this still fails with
-# "Not Authorized" — an account-tier gate this default can't and
-# shouldn't try to work around, correctly caught and logged per-tenant by
-# pull_all()'s existing error handling rather than failing the whole pull.
-def _campaign_attribution_params() -> dict:
-    return {"metrics": ["REVENUE", "DEAL_COUNT"], "hasReadToolInstructions": True}
+_SAFE_OBJECT_TYPE_ID_RE = re.compile(r"^\d+-\d+$")
 
 
-# Confirmed live: neither tool requires any parameter to return a
-# meaningful default (a portal-wide rollup), but both have a truly
-# required field their own schema rejects an empty call without —
-# get_content_analytics_report needs `mode`, get_marketing_email_analytics
-# needs a `mode` object with a date range. pull_all() looks a tool up here
-# before calling it with no other params; anything not listed gets none,
-# same as before. read_campaign_data is deliberately NOT here — every one
-# of its operations requires a specific campaignCrmObjectId, so it can't
-# take a single fixed default the way these can; see pull_campaign_data().
-_DEFAULT_TOOL_PARAMS = {
-    "get_content_analytics_report": lambda: {"mode": "TOTALS"},
-    "get_marketing_email_analytics": _marketing_email_overview_params,
-    "get_campaign_attribution_reports": _campaign_attribution_params,
-}
+def _is_safe_object_type_id(object_type_id: str) -> bool:
+    """True only for HubSpot's real objectTypeId shape (e.g. "2-3465404").
+    Same defense-in-depth posture as _is_safe_property_name: a custom
+    object's objectTypeId always comes from HubSpot's own schema-discovery
+    response, never raw external input, before it's interpolated into a
+    URL path — but this project doesn't trust "it's internal" alone
+    anywhere else either (openspec/changes/custom-object-support)."""
+    return bool(_SAFE_OBJECT_TYPE_ID_RE.match(object_type_id))
 
 
 class ReadOnlyViolation(Exception):
-    """Raised if a tool that looks like a write operation would otherwise be called."""
+    """Raised if a call would reach a write-shaped HubSpot endpoint."""
 
 
-def _tool_name_words(tool_name: str) -> list[str]:
-    # Split on non-letter characters so snake_case/kebab-case tool names
-    # (e.g. "create_contact") are checked word-by-word. A plain \b-based
-    # regex does NOT catch this: underscore counts as a \w character, so
-    # \bcreate\b never matches inside "create_contact".
-    return re.split(r"[^a-zA-Z]+", tool_name.lower())
-
-
-def _has_write_verb(tool_name: str) -> bool:
-    return any(word in _WRITE_VERBS for word in _tool_name_words(tool_name))
-
-
-def _is_read_safe(tool_name: str) -> bool:
-    if _has_write_verb(tool_name):
-        return False
-    return any(word in _READ_VERBS for word in _tool_name_words(tool_name))
-
-
-def _is_in_scope(tool_name: str) -> bool:
-    lowered = tool_name.lower()
-    return any(keyword in lowered for keyword in IN_SCOPE_OBJECT_KEYWORDS)
-
-
-def _extract_result(result) -> object:
-    """Returns a tool call's real payload. Confirmed live across every one
-    of HubSpot's 20 real MCP tools: none declares an outputSchema, so
-    FastMCP's result.data/.structured_content are always None — the real
-    payload is JSON text inside the first content block instead. Falls
-    back to result.data first regardless, in case that ever changes for a
-    given tool, rather than assuming it will always be unset."""
-    if result.data is not None:
-        return result.data
-    if not result.content:
-        return None
-    text = getattr(result.content[0], "text", None)
-    if text is None:
-        return result.content
-    try:
-        return json.loads(text)
-    except (TypeError, ValueError):
-        return text
-
-
-def _unwrap_query_crm_data(value: object) -> object:
-    """query_crm_data's real response (confirmed live) wraps each record in
-    a citation-oriented envelope distinct from other tools' plain JSON
-    objects: {"results": [{"content": "<json-encoded record>"}, ...],
-    "instructions": "..."} — "instructions" is LLM-facing guidance, not
-    data, and each result's "content" is itself a JSON-encoded string, not
-    a dict. Flattens this to a plain list of record dicts."""
-    if not isinstance(value, dict) or "results" not in value:
-        return value
-
-    records = []
-    for item in value.get("results", []):
-        content = item.get("content") if isinstance(item, dict) else item
-        if isinstance(content, str):
-            try:
-                records.append(json.loads(content))
-                continue
-            except (TypeError, ValueError):
-                pass
-        records.append(content)
-    return records
-
-
-def _is_safe_select(sql: str) -> bool:
-    """True only for a single, plain SELECT statement with no write-shaped
-    keyword anywhere in it. This is defense in depth, not the primary
-    control — pull_crm_objects() only ever constructs "SELECT * FROM
-    {TYPE}" itself, never from caller input — but the tickets read-verb
-    allowlist above establishes this project's own precedent of not
-    trusting scope/intent alone, so the same posture applies here."""
-    stripped = sql.strip()
-    if not re.match(r"(?is)^select\b", stripped):
-        return False
-
-    # Reject anything after a first semicolon (stacked statements), a
-    # single optional trailing semicolon is fine.
-    body = stripped[:-1] if stripped.endswith(";") else stripped
-    if ";" in body:
-        return False
-
-    words = set(re.split(r"[^a-zA-Z]+", body.lower()))
-    return not (words & _SQL_WRITE_KEYWORDS)
+class HubSpotRateLimited(Exception):
+    """Raised when HubSpot returns 429 for a request this module made."""
 
 
 class HubSpotDataPullClient:
@@ -390,260 +220,592 @@ class HubSpotDataPullClient:
     def __init__(self, hub_id: str) -> None:
         self.hub_id = hub_id
 
-    async def _client(self, access_token: str) -> Client:
-        # auth takes the raw token; FastMCP applies the "Bearer " scheme itself.
-        transport = StreamableHttpTransport(url=HUBSPOT_MCP_URL, auth=access_token)
-        return Client(transport)
-
     def log_pull_failure(self, tool: str, exc: Exception) -> None:
         """Public (no leading underscore) so other callers of this class's
-        pull methods (e.g. session/live_session.py's query_hubspot_data)
-        log a failed tool call under the same hubspot_pull.tool_failed
-        event name and field convention every other pull-failure path
-        uses, instead of inventing a second, differently-named one."""
+        pull methods (e.g. session/live_session.py's category tools) log a
+        failed call under the same hubspot_pull.tool_failed event name and
+        field convention every other pull-failure path uses."""
         logger.error("hubspot_pull.tool_failed", hub_id=self.hub_id, tool=tool, error=str(exc))
 
-    async def list_read_only_tools(self, client: Client | None = None) -> list[str]:
-        """Returns in-scope, read-safe tool names for this tenant's portal.
-        Reuses `client` if given (see pull_all()); opens and closes its own
-        connection otherwise, for standalone callers."""
-        if client is not None:
-            tools = await client.list_tools()
-        else:
-            access_token = await mcp_vault.get_access_token(self.hub_id)
-            async with await self._client(access_token) as owned_client:
-                tools = await owned_client.list_tools()
+    async def _client_for_hub(self) -> tuple[httpx.AsyncClient, dict]:
+        access_token = await vault.get_access_token(self.hub_id)
+        return httpx.AsyncClient(timeout=30.0), {"Authorization": f"Bearer {access_token}"}
 
-        selected = []
-        write_shaped = []
-        unrecognized_no_read_verb = []
-        read_safe_but_out_of_scope = []
-        for tool in tools:
-            name = tool.name
-            if _has_write_verb(name):
-                write_shaped.append(name)
-            elif not _is_read_safe(name):
-                unrecognized_no_read_verb.append(name)
-            elif _is_in_scope(name):
-                selected.append(name)
-            else:
-                read_safe_but_out_of_scope.append(name)
+    async def _headers_for(self, client_was_provided: bool) -> dict:
+        """When a caller passes its own `client` (reusing one connection
+        across several calls, see pull_all()), this project still needs
+        that tenant's own current token for the Authorization header —
+        vault.get_access_token()'s own cache makes the extra lookup cheap
+        (a lock-free Postgres read unless the token is near expiry)."""
+        access_token = await vault.get_access_token(self.hub_id)
+        return {"Authorization": f"Bearer {access_token}"}
 
-        if write_shaped:
-            logger.warning(
-                "hubspot_pull.write_tools_excluded", hub_id=self.hub_id, count=len(write_shaped)
-            )
-        if unrecognized_no_read_verb:
-            # Excluded only because the name didn't match a recognized read
-            # verb, not because it looked like a write — worth reviewing once
-            # connected to the real endpoint, in case a legitimate read tool
-            # is being missed and _READ_VERBS needs another entry.
-            logger.warning(
-                "hubspot_pull.unrecognized_tools_excluded",
-                hub_id=self.hub_id,
-                count=len(unrecognized_no_read_verb),
-                tool_names=unrecognized_no_read_verb,
-            )
-        if read_safe_but_out_of_scope:
-            # Read-safe, but doesn't match any in-scope object keyword — not
-            # a safety concern (nothing unsafe is excluded here), but this
-            # branch used to log nothing at all, which is exactly how
-            # get_organization_details (the real path to the spec's "teams"
-            # object) went unnoticed for a while. Logged at info, not
-            # warning, since exclusion here is expected for genuinely
-            # out-of-scope tools (e.g. search_conversations, a HubSpot inbox
-            # feature never named in spec Section 4.4) as well as ones that
-            # do need reviewing.
-            logger.info(
-                "hubspot_pull.out_of_scope_tools_excluded",
-                hub_id=self.hub_id,
-                count=len(read_safe_but_out_of_scope),
-                tool_names=read_safe_but_out_of_scope,
-            )
-        return selected
+    async def _paginate(
+        self, client: httpx.AsyncClient, headers: dict, path: str, params: dict, results_key: str = "results"
+    ) -> list[dict]:
+        """Follows HubSpot's standard v3 cursor pagination (`paging.next.after`)
+        until exhausted. Every standard CRM object list endpoint, and
+        several of the generic-capability endpoints below, share this
+        exact shape."""
+        records: list[dict] = []
+        cursor = None
+        while True:
+            call_params = dict(params)
+            if cursor:
+                call_params["after"] = cursor
+            response = await client.get(f"{HUBSPOT_API_BASE}{path}", headers=headers, params=call_params)
+            if response.status_code == 429:
+                raise HubSpotRateLimited(path)
+            response.raise_for_status()
+            body = response.json()
+            records.extend(body.get(results_key, []))
+            cursor = body.get("paging", {}).get("next", {}).get("after")
+            if not cursor:
+                break
+        return records
 
-    async def pull_object(self, tool_name: str, client: Client | None = None, **params) -> dict:
-        """Calls a single read-only tool for this tenant. Raises ReadOnlyViolation
-        if the tool name suggests a write operation (or, for query_crm_data,
-        if its sql parameter isn't a plain SELECT), never calls it. Reuses
-        `client` if given (see pull_all()); opens and closes its own
-        connection otherwise, for standalone callers."""
-        if tool_name in _SQL_QUERY_TOOLS:
-            if not _is_safe_select(params.get("sql", "")):
-                raise ReadOnlyViolation(
-                    f"Refusing non-SELECT SQL for {tool_name}: {params.get('sql', '')!r}"
-                )
-        elif not _is_read_safe(tool_name):
-            raise ReadOnlyViolation(f"Refusing to call non-read-only tool: {tool_name}")
-
-        if client is not None:
-            result = await client.call_tool(tool_name, params)
-        else:
-            access_token = await mcp_vault.get_access_token(self.hub_id)
-            async with await self._client(access_token) as owned_client:
-                result = await owned_client.call_tool(tool_name, params)
-        value = _extract_result(result)
-        if tool_name in _SQL_QUERY_TOOLS:
-            value = _unwrap_query_crm_data(value)
-        return value
+    # --- core CRM objects: /crm/v3/objects/{slug} ---
 
     async def pull_crm_objects(
-        self, client: Client | None = None, object_types: list[str] | None = None
+        self,
+        client: httpx.AsyncClient | None = None,
+        object_types: list[str] | None = None,
+        properties: dict[str, list[str]] | None = None,
+        headers: dict | None = None,
     ) -> dict[str, object]:
-        """Pulls every confirmed-real CRM object type (CRM_OBJECT_TYPES) via
-        query_crm_data — the one tool that can read contacts, companies,
-        deals, tickets, etc. (see this module's docstring for why these
-        can't go through list_read_only_tools()'s generic name-based
-        filter). Each query is a fixed "SELECT hs_object_id, * FROM {TYPE}"
-        authored here, never from external input. All object types are
-        pulled concurrently — each is independent and already isolates its
-        own failure into its own result key, so there's nothing
-        serialization would protect here, only latency it would add.
+        """Pulls every requested CRM object type. Standard types
+        (CRM_OBJECT_REST_SLUGS) go through `/crm/v3/objects/{slug}`; the
+        four non-standard types (CAMPAIGN, LANDING_PAGE, BLOG_POST,
+        OBJECT_LIST) route to their own adapter methods, since they live
+        under entirely different HubSpot API families. All object types
+        are pulled concurrently — each is independent and already
+        isolates its own failure into its own result key.
 
-        hs_object_id is selected explicitly, not left to "*" alone —
-        confirmed live that HubSpot's default property set for every CRM
-        object type excludes its own object ID, and "id" isn't a valid
-        property name at all (HubSpot's own error names hs_object_id as
-        the real one). Without it, every pulled row is missing the one
-        field sync.airtable_staging._index_crm_objects needs to populate
-        hubspot_object_index, which is what Sybill's tenant resolution
-        looks up — confirmed live: that table stayed empty for every
-        tenant this pulled, with no error anywhere in the pull itself,
-        since a missing Source ID is silently skipped, not raised.
+        properties: an optional {object_type: [property_name, ...]} map.
+        When given for a standard object type, the REST `properties=`
+        query param is set to exactly those names — confirmed live
+        (openspec/changes/hubspot-rest-api-pivot, task 2.3) that REST's
+        `properties` parameter is a true explicit selection, unlike the
+        prior MCP-based mechanism's additive behavior. Omitting it (or
+        `properties=None` entirely) keeps HubSpot's own default set.
 
-        object_types defaults to the full CRM_OBJECT_TYPES (pull_all()'s
-        use), but a caller that only needs a subset (session/live_session.py's
-        query_hubspot_data, matching a staff member's free-text query) can
-        pass just those — reusing this exact SQL-construction and
-        failure-handling logic instead of re-implementing it."""
+        headers: lets a caller that already resolved this tenant's
+        Authorization header (e.g. pull_all(), which resolves it once for
+        an entire multi-call pull) pass it straight through instead of
+        this method fetching it again from the vault — vault.get_access_token
+        caches, so a second fetch was never incorrect, just a needless
+        extra Postgres round trip on every call. Only consulted when
+        `client` is also given; irrelevant (and unused) on the
+        owns-its-own-client path, which always resolves both together."""
         types = object_types if object_types is not None else CRM_OBJECT_TYPES
+        owns_client = client is None
+        if owns_client:
+            try:
+                client, headers = await self._client_for_hub()
+            except Exception as exc:
+                self.log_pull_failure("token_fetch", exc)
+                return {"error": "pull_failed"}
+        elif headers is None:
+            headers = await self._headers_for(client_was_provided=True)
 
         async def _pull_one(object_type: str) -> tuple[str, object]:
-            sql = f"SELECT hs_object_id, * FROM {object_type}"
             try:
-                return object_type, await self.pull_object("query_crm_data", client=client, sql=sql)
+                if object_type in _NON_STANDARD_OBJECT_TYPES:
+                    # These four don't go through the CRM Objects API's
+                    # `properties=` mechanism at all (each lives under its
+                    # own API family with no equivalent field-narrowing
+                    # param this project has wired up) — a caller that
+                    # requested one anyway gets the unfiltered response,
+                    # not silently: logged here so it's discoverable
+                    # rather than an invisible no-op.
+                    if (properties or {}).get(object_type):
+                        logger.warning(
+                            "hubspot_client.properties_ignored_for_non_standard_type",
+                            hub_id=self.hub_id,
+                            object_type=object_type,
+                        )
+                    if object_type == "CAMPAIGN":
+                        return object_type, await self._pull_campaigns_as_records(client, headers)
+                    if object_type == "LANDING_PAGE":
+                        return object_type, await self._pull_landing_pages(client, headers)
+                    if object_type == "BLOG_POST":
+                        return object_type, await self._pull_blog_posts(client, headers)
+                    if object_type == "OBJECT_LIST":
+                        return object_type, await self._pull_lists(client, headers)
+                    raise KeyError(
+                        f"{object_type!r} is in _NON_STANDARD_OBJECT_TYPES but has no dispatch branch here"
+                    )
+
+                slug = CRM_OBJECT_REST_SLUGS[object_type]
+                params = {"limit": 100}
+                requested = (properties or {}).get(object_type)
+                if requested:
+                    safe = [p for p in requested if _is_safe_property_name(p)]
+                    if safe:
+                        params["properties"] = ",".join(safe)
+                records = await self._paginate(client, headers, f"/crm/v3/objects/{slug}", params)
+                return object_type, records
             except Exception as exc:
-                self.log_pull_failure(f"query_crm_data:{object_type}", exc)
+                self.log_pull_failure(f"crm_objects:{object_type}", exc)
                 return object_type, {"error": "pull_failed"}
 
-        pairs = await asyncio.gather(*(_pull_one(object_type) for object_type in types))
-        return dict(pairs)
-
-    async def pull_campaign_data(self, client: Client | None = None) -> list[dict]:
-        """Pulls engagement metrics for every real campaign in this
-        tenant's portal via read_campaign_data — unlike every other tool
-        in this module, every one of its operations requires a specific
-        campaignCrmObjectId, so there's no single fixed default call the
-        way get_campaign_attribution_reports has (see _DEFAULT_TOOL_PARAMS).
-        Enumerates real campaign IDs via query_crm_data first (graceful,
-        empty result if CAMPAIGN isn't accessible on this tenant's account
-        tier — see design.md's decision log), then calls read_campaign_data
-        once per campaign, concurrently. Confirmed live against a real
-        Enterprise-tier test account with a real campaign.
-
-        Returns a list of per-campaign records (each carrying its own "id"),
-        not a dict keyed by campaign ID — this is staged into Airtable's
-        Campaigns table the same way every other object type is
-        (sync/airtable_staging.py's stage_tenant_pull expects a list of
-        records or a single record, not an ID-keyed mapping)."""
         try:
-            campaigns = await self.pull_object(
-                "query_crm_data", client=client, sql="SELECT hs_object_id, hs_name FROM CAMPAIGN"
-            )
-        except Exception as exc:
-            self.log_pull_failure("query_crm_data:CAMPAIGN_IDS", exc)
+            pairs = await asyncio.gather(*(_pull_one(object_type) for object_type in types))
+            return dict(pairs)
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    # --- custom/standard property discovery: /crm/v3/properties/{slug} ---
+
+    async def discover_object_properties(
+        self, object_type: str, client: httpx.AsyncClient | None = None, headers: dict | None = None
+    ) -> list[str]:
+        """Returns every real property name for one object type on this
+        tenant's portal, including custom (portal-specific) properties —
+        via REST's `/crm/v3/properties/{slug}`, which (unlike the prior
+        MCP-based search_properties) returns every property for the type
+        in one call with no keyword-search step needed."""
+        definitions = await self.discover_object_property_definitions(object_type, client=client, headers=headers)
+        return [d["name"] for d in definitions]
+
+    async def discover_object_property_definitions(
+        self, object_type: str, client: httpx.AsyncClient | None = None, headers: dict | None = None
+    ) -> list[dict]:
+        """Like discover_object_properties, but returns each property's
+        full definition, including REST's own authoritative `hubspotDefined`
+        boolean — the real signal this project's prior is_custom_property_name()
+        heuristic existed only because MCP's search_properties didn't expose
+        it (openspec/changes/hubspot-rest-api-pivot, task 3.2)."""
+        slug = CRM_OBJECT_REST_SLUGS.get(object_type)
+        if slug is None:
             return []
+        return await self._fetch_property_definitions(slug, f"properties:{object_type}", client, headers)
 
-        campaign_ids = []
-        for campaign in campaigns or []:
-            properties = campaign.get("properties", {}) if isinstance(campaign, dict) else {}
-            campaign_id = properties.get("hs_object_id")
-            # Identity check, not truthiness — a real hs_object_id of "0"
-            # (unlikely but not impossible) must not be dropped the way a
-            # missing one is.
-            if campaign_id is not None:
-                campaign_ids.append(campaign_id)
+    async def _fetch_property_definitions(
+        self,
+        slug_or_object_type_id: str,
+        log_tool_name: str,
+        client: httpx.AsyncClient | None = None,
+        headers: dict | None = None,
+    ) -> list[dict]:
+        """The actual `GET /crm/v3/properties/{slug}` fetch+parse, shared
+        by discover_object_property_definitions (standard objects, keyed
+        by a CRM_OBJECT_REST_SLUGS slug) and discover_custom_object_properties
+        (custom objects, keyed by a runtime-discovered objectTypeId) —
+        REST's properties endpoint works identically either way, confirmed
+        live (openspec/changes/custom-object-support)."""
+        owns_client = client is None
+        try:
+            if owns_client:
+                client, headers = await self._client_for_hub()
+            elif headers is None:
+                headers = await self._headers_for(client_was_provided=True)
+        except Exception as exc:
+            # A token-fetch failure (e.g. an unknown/never-installed
+            # tenant) is just as much a "this discovery attempt failed"
+            # case as an HTTP-level failure below — must degrade to []
+            # the same way, not propagate uncaught out of a method whose
+            # whole contract is "never crash, just return what it can."
+            self.log_pull_failure(log_tool_name, exc)
+            return []
+        try:
+            response = await client.get(
+                f"{HUBSPOT_API_BASE}/crm/v3/properties/{slug_or_object_type_id}", headers=headers
+            )
+            response.raise_for_status()
+            body = response.json()
+            return [
+                {"name": r["name"], "hubspotDefined": bool(r.get("hubspotDefined"))}
+                for r in body.get("results", [])
+                if isinstance(r, dict) and _is_safe_property_name(r.get("name", ""))
+            ]
+        except Exception as exc:
+            self.log_pull_failure(log_tool_name, exc)
+            return []
+        finally:
+            if owns_client:
+                await client.aclose()
 
-        # Bounded, not one call per campaign in an unbounded single burst —
-        # a tenant with a large campaign count would otherwise fire
-        # dozens/hundreds of concurrent requests at mcp.hubspot.com with no
-        # outbound throttling anywhere on this path, risking rate-limit
-        # errors that show up indistinguishable from genuine per-item
-        # failures.
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CAMPAIGN_PULLS)
+    # --- custom objects: runtime-discovered, never a fixed slug
+    # (openspec/changes/custom-object-support) ---
 
-        async def _pull_one(campaign_id: str) -> dict:
-            async with semaphore:
-                try:
-                    metrics = await self.pull_object(
-                        "read_campaign_data",
-                        client=client,
-                        operation="GET_ANALYTICS",
-                        analyticsRequest={
-                            "requests": [
-                                {"campaignCrmObjectId": int(campaign_id), "requestedData": "METRICS"}
-                            ]
-                        },
-                    )
-                    record = dict(metrics) if isinstance(metrics, dict) else {"metrics": metrics}
-                    record["id"] = campaign_id
-                    return record
-                except Exception as exc:
-                    self.log_pull_failure(f"read_campaign_data:{campaign_id}", exc)
-                    return {"id": campaign_id, "error": "pull_failed"}
+    async def discover_custom_object_schemas(
+        self, client: httpx.AsyncClient | None = None, headers: dict | None = None
+    ) -> list[dict]:
+        """Every custom object schema defined on this tenant's portal,
+        discovered fresh per call — there is no fixed lookup table for
+        these the way CRM_OBJECT_REST_SLUGS is for standard objects, since
+        a custom object is defined per-portal, at runtime, by whoever
+        configured that client's HubSpot instance. Returns each schema's
+        `objectTypeId` (the identifier every other method here needs),
+        `name`, and `labels`. A different path prefix than every other
+        endpoint in this module (`crm-object-schemas/v3`, not `crm/v3`) —
+        confirmed live against HubSpot's own docs, not assumed. Degrades
+        to `[]` on a portal without Custom Objects access (an Enterprise-
+        tier HubSpot feature) rather than raising — confirmed live the
+        baseline-tier test portal can't even create a custom object at
+        all, let alone grant this scope."""
+        owns_client = client is None
+        try:
+            if owns_client:
+                client, headers = await self._client_for_hub()
+            elif headers is None:
+                headers = await self._headers_for(client_was_provided=True)
+        except Exception as exc:
+            self.log_pull_failure("custom_object_schemas", exc)
+            return []
+        try:
+            response = await client.get(f"{HUBSPOT_API_BASE}/crm-object-schemas/v3/schemas", headers=headers)
+            response.raise_for_status()
+            body = response.json()
+            return [
+                {
+                    "objectTypeId": r["objectTypeId"],
+                    "name": r.get("name"),
+                    "labels": r.get("labels"),
+                }
+                for r in body.get("results", [])
+                if isinstance(r, dict) and _is_safe_object_type_id(r.get("objectTypeId", ""))
+            ]
+        except Exception as exc:
+            self.log_pull_failure("custom_object_schemas", exc)
+            return []
+        finally:
+            if owns_client:
+                await client.aclose()
 
-        return list(await asyncio.gather(*(_pull_one(campaign_id) for campaign_id in campaign_ids)))
+    async def pull_custom_object(
+        self,
+        object_type_id: str,
+        client: httpx.AsyncClient | None = None,
+        headers: dict | None = None,
+        properties: list[str] | None = None,
+    ) -> list[dict] | dict:
+        """Reads one custom object's records by its `objectTypeId` (from
+        discover_custom_object_schemas — there is no friendly-name lookup
+        for a custom object the way CRM_OBJECT_ALIASES resolves one for
+        standard types; a caller must discover the identifier first).
+        Same paginated GET /crm/v3/objects/{objectTypeId} shape as every
+        standard object already pulled — REST's Objects API doesn't
+        distinguish standard from custom here, only the identifier
+        differs. Returns `{"error": "pull_failed"}` (not a raised
+        exception) on failure, matching every other object-family adapter
+        in this module."""
+        if not _is_safe_object_type_id(object_type_id):
+            return {"error": "pull_failed"}
+        owns_client = client is None
+        try:
+            if owns_client:
+                client, headers = await self._client_for_hub()
+            elif headers is None:
+                headers = await self._headers_for(client_was_provided=True)
+        except Exception as exc:
+            self.log_pull_failure(f"custom_object:{object_type_id}", exc)
+            return {"error": "pull_failed"}
+        try:
+            params = {"limit": 100}
+            safe_properties = [p for p in (properties or []) if _is_safe_property_name(p)]
+            if safe_properties:
+                params["properties"] = ",".join(safe_properties)
+            return await self._paginate(client, headers, f"/crm/v3/objects/{object_type_id}", params)
+        except Exception as exc:
+            self.log_pull_failure(f"custom_object:{object_type_id}", exc)
+            return {"error": "pull_failed"}
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def discover_custom_object_properties(
+        self, object_type_id: str, client: httpx.AsyncClient | None = None, headers: dict | None = None
+    ) -> list[dict]:
+        """Every real property defined on one custom object, keyed by its
+        `objectTypeId` — reuses the exact same `GET /crm/v3/properties/{type}`
+        mechanism discover_object_property_definitions already uses for
+        standard objects; REST's properties endpoint works identically
+        for a custom object's objectTypeId, confirmed live."""
+        if not _is_safe_object_type_id(object_type_id):
+            return []
+        return await self._fetch_property_definitions(
+            object_type_id, f"custom_object_properties:{object_type_id}", client, headers
+        )
+
+    # --- non-standard object families ---
+
+    async def _pull_campaigns_as_records(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
+        """Marketing Campaigns API (`/marketing/v3/campaigns`) — a
+        genuinely different shape from the CRM Objects API. Account-tier
+        gating (Campaigns requires a paid marketing tier) degrades
+        gracefully here the same way the prior MCP-based path did: a
+        real 403/401 from HubSpot on a non-Enterprise portal is caught by
+        pull_crm_objects()'s own outer try/except, not specially handled
+        here."""
+        return await self._paginate(client, headers, "/marketing/v3/campaigns", {"limit": 100})
+
+    async def _pull_landing_pages(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
+        """HubSpot's CMS API for landing pages."""
+        return await self._paginate(client, headers, "/cms/v3/pages/landing-pages", {"limit": 100})
+
+    async def _pull_blog_posts(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
+        """HubSpot's CMS API for blog posts."""
+        return await self._paginate(client, headers, "/cms/v3/blogs/posts", {"limit": 100})
+
+    async def _pull_lists(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
+        """HubSpot's Lists API. Its own "search" operation is a POST (filter
+        criteria go in the request body) but is a real, read-only search —
+        this project's one deliberate exception to "GET only," reviewed and
+        flagged explicitly rather than silently allowed.
+
+        Paginated via this endpoint's own hasMore/offset response fields
+        (not the standard paging.next.after cursor shape _paginate
+        handles — the Lists Search endpoint uses a different pagination
+        convention), looping until hasMore is false. Confirmed via
+        HubSpot's own API reference: the response's `offset` value is fed
+        back as the next request's `offset`. Without this loop, a tenant
+        with more than 100 real lists would silently lose everything past
+        the first page."""
+        results: list[dict] = []
+        offset = 0
+        while True:
+            response = await client.post(
+                f"{HUBSPOT_API_BASE}/crm/v3/lists/search",
+                headers=headers,
+                json={"count": 100, "offset": offset},
+            )
+            if response.status_code == 429:
+                raise HubSpotRateLimited("/crm/v3/lists/search")
+            response.raise_for_status()
+            body = response.json()
+            results.extend(body.get("lists", []))
+            if not body.get("hasMore"):
+                break
+            offset = body.get("offset", offset)
+        return results
+
+    # --- per-campaign metrics ---
+
+    async def pull_campaign_data(
+        self, client: httpx.AsyncClient | None = None, headers: dict | None = None
+    ) -> list[dict]:
+        """Pulls attribution metrics for every real campaign in this
+        tenant's portal via `/marketing/v3/campaigns/{campaignGuid}/reports/metrics`
+        — unlike a plain campaign list, every one of these calls needs a
+        specific campaign GUID, so campaigns are enumerated first, then
+        each is queried for metrics, concurrently but bounded."""
+        owns_client = client is None
+        if owns_client:
+            try:
+                client, headers = await self._client_for_hub()
+            except Exception as exc:
+                self.log_pull_failure("token_fetch", exc)
+                return []
+        elif headers is None:
+            headers = await self._headers_for(client_was_provided=True)
+
+        try:
+            try:
+                campaigns = await self._paginate(client, headers, "/marketing/v3/campaigns", {"limit": 100})
+            except Exception as exc:
+                self.log_pull_failure("campaigns:list", exc)
+                return []
+
+            campaign_guids = [c.get("id") for c in campaigns if isinstance(c, dict) and c.get("id")]
+            semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CAMPAIGN_PULLS)
+
+            async def _pull_one(campaign_guid: str) -> dict:
+                async with semaphore:
+                    try:
+                        response = await client.get(
+                            f"{HUBSPOT_API_BASE}/marketing/v3/campaigns/{campaign_guid}/reports/metrics",
+                            headers=headers,
+                        )
+                        response.raise_for_status()
+                        record = response.json()
+                        record["id"] = campaign_guid
+                        return record
+                    except Exception as exc:
+                        self.log_pull_failure(f"campaign_metrics:{campaign_guid}", exc)
+                        return {"id": campaign_guid, "error": "pull_failed"}
+
+            return list(await asyncio.gather(*(_pull_one(g) for g in campaign_guids)))
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    # --- generic capabilities (formerly MCP's dynamic tools) ---
+
+    async def list_read_only_tools(self, client: httpx.AsyncClient | None = None) -> list[str]:
+        """Returns this project's fixed, hand-maintained set of generic
+        read capability names — the REST-era replacement for the prior
+        MCP-based dynamic tool discovery. No live discovery call is made;
+        REST's endpoint set is known ahead of time, so what's "available"
+        is simply what this module implements."""
+        return list(_GENERIC_CAPABILITIES.keys())
+
+    async def pull_object(
+        self, tool_name: str, client: httpx.AsyncClient | None = None, headers: dict | None = None, **params
+    ) -> dict:
+        """Calls one named generic capability for this tenant — the
+        REST-era replacement for calling an MCP tool by name. `tool_name`
+        must be one of list_read_only_tools()'s fixed set; anything else
+        raises ReadOnlyViolation before any HubSpot call is made.
+        Degrades to {"error": "pull_failed"} on any other failure (a
+        token-fetch problem or the capability's own HubSpot call failing),
+        matching every other leaf pull method in this file — a caller
+        that doesn't independently wrap this call still gets the
+        "never crash, just degrade" guarantee."""
+        capability = _GENERIC_CAPABILITIES.get(tool_name)
+        if capability is None:
+            raise ReadOnlyViolation(f"Refusing to call unrecognized capability: {tool_name}")
+
+        owns_client = client is None
+        try:
+            if owns_client:
+                client, headers = await self._client_for_hub()
+            elif headers is None:
+                headers = await self._headers_for(client_was_provided=True)
+        except Exception as exc:
+            self.log_pull_failure(tool_name, exc)
+            return {"error": "pull_failed"}
+        try:
+            return await capability(self, client, headers, **params)
+        except Exception as exc:
+            self.log_pull_failure(tool_name, exc)
+            return {"error": "pull_failed"}
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def _owners(self, client: httpx.AsyncClient, headers: dict, **_params) -> list[dict]:
+        """`/crm/v3/owners/` — the REST equivalent of the prior
+        search_owners MCP tool."""
+        return await self._paginate(client, headers, "/crm/v3/owners/", {"limit": 100})
+
+    async def _organization_details(self, client: httpx.AsyncClient, headers: dict, **_params) -> dict:
+        """Composed from three real, independently-scoped REST endpoints —
+        the equivalent of the prior get_organization_details MCP tool,
+        which itself bundled teams, seats/users, and account info into
+        one call. REST doesn't have one bundled endpoint for this, so
+        this assembles the same shape from `/settings/v3/users/teams`,
+        `/settings/v3/users/`, and `/account-info/v3/details`.
+
+        Each call degrades independently to {"error": "pull_failed"} for
+        just its own key rather than failing the whole method — confirmed
+        live that `/settings/v3/users/teams` needs its own scope distinct
+        from `/settings/v3/users/`, so a portal missing just that one
+        scope would otherwise lose the other two endpoints' real data too
+        even though they'd have succeeded on their own."""
+
+        async def _get(path: str) -> dict:
+            try:
+                response = await client.get(f"{HUBSPOT_API_BASE}{path}", headers=headers)
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:
+                self.log_pull_failure(f"organization_details:{path}", exc)
+                return {"error": "pull_failed"}
+
+        teams, users, account = await asyncio.gather(
+            _get("/settings/v3/users/teams"),
+            _get("/settings/v3/users/"),
+            _get("/account-info/v3/details"),
+        )
+        return {"teams": teams, "users": users, "account": account}
+
+    async def _content_analytics(self, client: httpx.AsyncClient, headers: dict, **_params) -> dict:
+        """`/analytics/v2/reports/pages/total` — the REST equivalent of
+        the prior get_content_analytics_report MCP tool. HubSpot's
+        Analytics API is v2, not v3, and less uniformly documented than
+        the CRM APIs — confirmed real and callable, moderate rather than
+        high confidence relative to the CRM endpoints above."""
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=30)
+        response = await client.get(
+            f"{HUBSPOT_API_BASE}/analytics/v2/reports/pages/total",
+            headers=headers,
+            params={"start": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d")},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def _marketing_email_analytics(self, client: httpx.AsyncClient, headers: dict, **_params) -> dict:
+        """`/marketing/v3/emails/statistics/list` — confirmed real REST
+        endpoint (this change's own research) for the prior
+        get_marketing_email_analytics MCP tool."""
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=30)
+        response = await client.get(
+            f"{HUBSPOT_API_BASE}/marketing/v3/emails/statistics/list",
+            headers=headers,
+            params={"startTimestamp": start.isoformat(), "endTimestamp": end.isoformat()},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def _campaign_attribution(self, client: httpx.AsyncClient, headers: dict, **_params) -> dict:
+        """Aggregates `/marketing/v3/campaigns/{id}/reports/metrics`
+        across every real campaign — the REST equivalent of the prior
+        get_campaign_attribution_reports MCP tool, which returned a
+        portal-wide rollup from one call; REST has no single bundled
+        rollup endpoint, so this assembles one from the same per-campaign
+        metrics pull_campaign_data() already does."""
+        records = await self.pull_campaign_data(client=client, headers=headers)
+        return {"campaigns": records}
 
     async def pull_all(self) -> dict[str, object]:
         """Pulls every in-scope, read-only object type for this tenant —
-        the generic per-object tools, the CRM object set via
-        query_crm_data, and per-campaign metrics. Tenant context is fixed
-        at construction time (self.hub_id), so every call in this method
-        is scoped to exactly one tenant's vaulted token.
-
-        Opens exactly one MCP connection for the whole pull (instead of one
-        per tool/object call) and runs the three independent groups of
-        work — generic tools, CRM objects, campaign data — concurrently,
-        rather than strictly sequentially, since none of them depend on
-        each other's results."""
+        the generic capabilities, the CRM object set, and per-campaign
+        metrics. Tenant context is fixed at construction time
+        (self.hub_id), so every call in this method is scoped to exactly
+        one tenant's vaulted token. Opens exactly one httpx.AsyncClient
+        for the whole pull, reused across every call."""
         try:
-            access_token = await mcp_vault.get_access_token(self.hub_id)
-            client = await self._client(access_token)
+            client, headers = await self._client_for_hub()
         except Exception as exc:
-            # Most plausibly a tenant that has completed only the Public
-            # App install and not yet the MCP Auth App install (a valid,
-            # documented interim state — see context/ONBOARDING_RUNBOOK.md)
-            # — logged under the same event name as every other per-tool
-            # failure so operators checking for hubspot_pull.tool_failed
-            # find it here too, instead of only a generic cycle-level error.
-            self.log_pull_failure("mcp_auth_connect", exc)
+            self.log_pull_failure("token_fetch", exc)
             return {"error": "pull_failed"}
 
-        async with client:
+        async def _pull_generic(tool_name: str) -> tuple[str, object]:
             try:
-                tool_names = await self.list_read_only_tools(client=client)
+                return tool_name, await self.pull_object(tool_name, client=client, headers=headers)
             except Exception as exc:
-                self.log_pull_failure("list_tools", exc)
-                return {"error": "pull_failed"}
+                self.log_pull_failure(tool_name, exc)
+                return tool_name, {"error": "pull_failed"}
 
-            async def _pull_generic(tool_name: str) -> tuple[str, object]:
-                try:
-                    default_params = _DEFAULT_TOOL_PARAMS.get(tool_name)
-                    params = default_params() if default_params else {}
-                    return tool_name, await self.pull_object(tool_name, client=client, **params)
-                except Exception as exc:
-                    self.log_pull_failure(tool_name, exc)
-                    return tool_name, {"error": "pull_failed"}
-
-            generic_tool_names = [name for name in tool_names if name not in PER_ITEM_TOOLS]
-
+        try:
+            # "campaign_attribution" is excluded here specifically: it's
+            # just pull_campaign_data() wrapped in a {"campaigns": [...]}
+            # envelope (see _campaign_attribution's docstring), and this
+            # method already calls pull_campaign_data() directly below for
+            # the "campaign_data" key — including it in the generic loop
+            # too would pull every campaign's metrics twice per cycle for
+            # no new data. It stays fully reachable as its own capability
+            # everywhere else (list_read_only_tools, pull_object,
+            # session/live_session.py's category tools) — this exclusion
+            # is scoped to pull_all()'s own redundant-work concern only,
+            # the same posture the prior MCP-based pull_all() held toward
+            # PER_ITEM_TOOLS.
+            tool_names = [
+                name for name in await self.list_read_only_tools(client=client) if name != "campaign_attribution"
+            ]
             generic_pairs, crm_results, campaign_results = await asyncio.gather(
-                asyncio.gather(*(_pull_generic(name) for name in generic_tool_names)),
-                self.pull_crm_objects(client=client),
-                self.pull_campaign_data(client=client),
+                asyncio.gather(*(_pull_generic(name) for name in tool_names)),
+                self.pull_crm_objects(client=client, headers=headers),
+                self.pull_campaign_data(client=client, headers=headers),
             )
+        finally:
+            await client.aclose()
 
         results: dict[str, object] = dict(generic_pairs)
         results.update(crm_results)
         results["campaign_data"] = campaign_results
         return results
+
+
+_GENERIC_CAPABILITIES = {
+    "owners": HubSpotDataPullClient._owners,
+    "organization_details": HubSpotDataPullClient._organization_details,
+    "content_analytics": HubSpotDataPullClient._content_analytics,
+    "marketing_email_analytics": HubSpotDataPullClient._marketing_email_analytics,
+    "campaign_attribution": HubSpotDataPullClient._campaign_attribution,
+}

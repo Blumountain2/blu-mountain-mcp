@@ -75,6 +75,9 @@ async def test_resolve_hub_id_unique_match():
 
 @pytest.mark.asyncio
 async def test_resolve_hub_id_company_type_match():
+    # "account" as a company-linked crm.type was confirmed live 2026-08-19
+    # via a real production payload (crm.id="53106879777", name=
+    # "Accelerated Analytics") — this fixture mirrors that real shape.
     pool = await get_pool()
     await pool.execute(
         "INSERT INTO hubspot_object_index (object_type, object_id, hub_id) VALUES ('company', 'acc-1', 'hub_a')"

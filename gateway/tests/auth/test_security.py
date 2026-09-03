@@ -2,13 +2,15 @@
 retention (SC-6)."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
 from config import settings
 from db import get_pool
 
-from auth import check_rate_limit, purge_expired_audit_log, record_audit
+from auth import check_rate_limit, purge_expired_audit_log, record_audit, record_audit_best_effort
+from auth import security
 
 
 @pytest.mark.asyncio
@@ -71,3 +73,25 @@ async def test_purge_expired_audit_log_only_removes_entries_past_retention(monke
     remaining_types = {row["event_type"] for row in remaining}
     assert "old_event" not in remaining_types
     assert "recent_event" in remaining_types
+
+
+@pytest.mark.asyncio
+async def test_record_audit_best_effort_writes_a_real_entry():
+    await record_audit_best_effort("test_best_effort_event", hub_id="hub_a", detail={"k": "v"})
+
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM audit_log WHERE event_type = 'test_best_effort_event'")
+    assert row is not None
+    assert row["hub_id"] == "hub_a"
+
+
+@pytest.mark.asyncio
+async def test_record_audit_best_effort_swallows_a_failure_in_the_audit_write_itself(monkeypatch):
+    """The realistic scenario this helper exists for: whatever the caller
+    was already handling failed, and the audit write itself then also
+    fails (most plausibly the same underlying outage) — this must not
+    raise, or the caller's own error handling would be aborted by a
+    second, unrelated exception."""
+    monkeypatch.setattr(security, "record_audit", AsyncMock(side_effect=RuntimeError("db unavailable")))
+
+    await record_audit_best_effort("test_event", hub_id="hub_a", detail={})  # must not raise
