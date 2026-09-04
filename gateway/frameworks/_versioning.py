@@ -1,10 +1,12 @@
 """Shared "next version" computation for this project's append-only
-versioned tables (`analysis_content`, `vertical_agent_templates`,
-`client_agent_instances`) — the same `SELECT COALESCE(MAX(version), 0)...
-+ 1` sequence was duplicated identically across `store.py`,
-`vertical_templates.py`, and `client_agent.py`'s own insert functions
-before this was factored out. The INSERT itself stays in each module,
-since the columns genuinely differ; only the version arithmetic is shared.
+versioned tables — used by `store.py` for `analysis_content`. (Also
+shared with `vertical_templates.py`/`client_agent.py`'s own insert
+functions before those modules and their tables were removed by
+openspec/changes/client-vertical-agent-classes; the version arithmetic
+stayed factored out here regardless, since it's still genuinely shared
+logic even with one remaining caller.) The INSERT itself stays in the
+calling module, since the columns genuinely differ; only the version
+arithmetic is shared.
 """
 
 import asyncpg

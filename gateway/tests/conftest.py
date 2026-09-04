@@ -62,8 +62,6 @@ _TABLES = [
     "analysis_content",
     "tenant_onboarding_profile_fields",
     "tenant_onboarding_profiles",
-    "client_agent_instances",
-    "vertical_agent_templates",
 ]
 
 

@@ -24,7 +24,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token
 
-from auth import record_audit
+from auth import TENANT_DISPLAY_NAME_SQL, record_audit
 from config import settings
 from db import get_pool
 from sync import HubSpotDataPullClient
@@ -35,9 +35,9 @@ from sync.hubspot_client import (
     CATEGORY_MARKETING_CONTENT,
     CATEGORY_USERS,
     CRM_OBJECT_ALIASES,
-    CRM_OBJECT_TYPES,
     GENERIC_TOOL_QUERY_ALIASES,
     OBJECT_TYPE_CATEGORIES,
+    resolve_object_type_aliases,
 )
 
 logger = structlog.get_logger()
@@ -155,24 +155,26 @@ async def _permitted_tenants(staff_identity: str) -> list[dict]:
     fail open just because the comparison itself was case-sensitive.
 
     Returns each tenant's effective display name alongside its hub_id —
-    COALESCE(portal_name, hub_domain, hub_id) computed here in SQL so every
-    caller sees a real, never-NULL name without re-deriving the same
-    fallback chain in Python. Each candidate is wrapped in NULLIF(TRIM(...), '')
-    first: an empty or whitespace-only string is not NULL to Postgres, so a
-    bare COALESCE would treat a blank portal_name as "the real name" instead
-    of falling through to hub_domain — the write path normalizes blanks to
-    NULL too (see hubspot_oauth.py's /install and _persist_new_tenant), but
-    this guards the read path independently rather than trusting every
-    possible writer got it right. portal_name is a human-curated name (set
-    only via /install's optional query param); hub_domain is HubSpot's own
-    domain for the portal, auto-captured at install time (HubSpot has no
-    API for an actual company/display name — confirmed against its
-    account-info endpoint)."""
+    `auth.TENANT_DISPLAY_NAME_SQL` (COALESCE(portal_name, hub_domain,
+    hub_id), shared with debug_api.py/onboarding.py) computed here in SQL
+    so every caller sees a real, never-NULL name without re-deriving the
+    same fallback chain in Python. Each candidate is wrapped in
+    NULLIF(TRIM(...), '') first: an empty or whitespace-only string is not
+    NULL to Postgres, so a bare COALESCE would treat a blank portal_name
+    as "the real name" instead of falling through to hub_domain — the
+    write path normalizes blanks to NULL too (see hubspot_oauth.py's
+    /install and _persist_new_tenant), but this guards the read path
+    independently rather than trusting every possible writer got it
+    right. portal_name is a human-curated name (set only via /install's
+    optional query param); hub_domain is HubSpot's own domain for the
+    portal, auto-captured at install time (HubSpot has no API for an
+    actual company/display name — confirmed against its account-info
+    endpoint)."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
+        f"""
         SELECT hub_id,
-               COALESCE(NULLIF(TRIM(portal_name), ''), NULLIF(TRIM(hub_domain), ''), hub_id) AS name
+               {TENANT_DISPLAY_NAME_SQL} AS name
         FROM tenants
         WHERE install_status = 'installed'
           AND hub_id NOT IN (
@@ -363,26 +365,27 @@ async def _query_category(category: str, object_type: str, properties: list[str]
     lowered = object_type.lower()
     result: dict = {}
 
+    category_types = _category_object_types(category)
+    # resolve_object_type_aliases handles irregular plurals/compound names
+    # a bare substring check misses ("companies" vs "COMPANY", "landing
+    # pages" vs "LANDING_PAGE") — shared with debug_api.py's own resolver.
+    all_matching_types = resolve_object_type_aliases(lowered)
+    in_category_types = [t for t in all_matching_types if t in category_types]
+
+    if all_matching_types and not in_category_types:
+        await _audit(email, hub_id, "live_query_wrong_category", {"object_type": object_type, "category": category})
+        return {"error": f"{object_type!r} is not in this tool's category; call the matching category tool instead"}
+
     # One shared connection for the whole query, mirroring pull_all()'s own
     # connection-reuse — a single interactive query can otherwise trigger
     # a CRM-type call, a campaign lookup, several per-campaign metric
     # calls, and a tool-discovery call, each opening its own connection.
+    # Deferred until after the wrong-category check above, so a rejected
+    # request never pays for a vault lookup and connection it's about to
+    # discard (openspec/changes/codebase-cleanup-and-dedup, task 7).
     http_client, headers = await client._client_for_hub()
 
-    category_types = _category_object_types(category)
-    # CRM_OBJECT_ALIASES handles irregular plurals/compound names a bare
-    # substring check misses ("companies" vs "COMPANY", "landing pages" vs
-    # "LANDING_PAGE") — see hubspot_client.py for why.
-    all_matching_types = [t for t in CRM_OBJECT_TYPES if lowered in CRM_OBJECT_ALIASES.get(t, set())]
-    in_category_types = [t for t in all_matching_types if t in category_types]
-
     async with http_client:
-        if all_matching_types and not in_category_types:
-            await _audit(
-                email, hub_id, "live_query_wrong_category", {"object_type": object_type, "category": category}
-            )
-            return {"error": f"{object_type!r} is not in this tool's category; call the matching category tool instead"}
-
         if in_category_types:
             properties_map = {t: properties for t in in_category_types} if properties else None
             result.update(

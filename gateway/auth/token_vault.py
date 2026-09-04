@@ -282,6 +282,21 @@ class TokenVault:
 vault = TokenVault()
 
 
+TENANT_DISPLAY_NAME_SQL = "COALESCE(NULLIF(TRIM(portal_name), ''), NULLIF(TRIM(hub_domain), ''), hub_id)"
+"""The tenant display-name fallback chain (portal_name -> hub_domain ->
+hub_id, blank values treated as absent) — a plain SQL expression
+fragment, not a function, since the 3 real call sites (session/
+live_session.py's list_my_tenants, gateway/debug_api.py's list_tenants,
+frameworks/onboarding.py's _effective_tenant_name) each embed it in a
+genuinely different surrounding query (one fetches a single tenant by
+hub_id, two fetch a filtered list of every installed tenant with
+different WHERE clauses) — a function trying to unify those shapes would
+be more machinery than 3 call sites justify. Interpolated directly into
+each query string (e.g. f"... {TENANT_DISPLAY_NAME_SQL} AS name ...");
+safe as plain string formatting since this is a static, hardcoded
+fragment with no caller-supplied input anywhere in it."""
+
+
 async def get_installed_hub_ids() -> list[str]:
     """Every tenant currently installed. Single source of truth for "which
     tenants are active" — shared by the scheduled sync (sync/airtable_staging.py)

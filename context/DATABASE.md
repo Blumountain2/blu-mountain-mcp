@@ -170,35 +170,9 @@ One row per populated field a profile considered — only ever populated fields,
 
 `review_field()` scopes its `UPDATE` through a JOIN back to `tenant_onboarding_profiles.hub_id`, the same structural isolation as the profile table itself — a review action can never target a profile belonging to a different tenant.
 
-## `vertical_agent_templates`
+## Vertical/client agent configuration — not database tables anymore
 
-Added `openspec/changes/separate-vertical-client-agents` (2026-09-01) — a deliberate, knowing supersession of `analysis-model-templates/design.md`'s original Non-Negotiable #6 ("one agent config per vertical, shared across every client, no per-client persistence"); see that Non-Negotiable's own note for the full reasoning. One independently-editable, versioned agent template per vertical — this project's own tool/model configuration layered around a vertical framework's raw text (`analysis_content` above), never a copy of that framework itself, which stays shared, unmodified, and Blu-Mountain-authored.
-
-| Column | Type | Notes |
-| :-- | :-- | :-- |
-| `id` | `SERIAL` (PK) | Referenced by `client_agent_instances.vertical_template_id`. |
-| `vertical` | `TEXT` | One of the six known verticals (`frameworks.vertical.KNOWN_VERTICALS`); validated at insert, not DB-enforced. |
-| `version` | `INTEGER` | Append-only, same pattern as `analysis_content.version` — `ingest_template()` always inserts a new version, never updates one in place, so a `client_agent_instances` row built from an earlier version keeps reading that exact version even after the vertical's template is updated. |
-| `system_prompt_additions` | `TEXT` | This vertical's own agent-configuration text (tool-use guidance, prioritization, style), layered after the raw framework text in the agent's system prompt (`frameworks/pull_agent.py::_system_prompt`). Empty string is valid and common — the six verticals were bootstrapped with empty additions specifically so day-one behavior didn't regress from the prior single-tier agent. |
-| `tool_config` | `JSONB` | Defaults to `'{}'::jsonb`. Currently reads one optional key, `max_tool_calls` (overrides `pull_agent.MAX_TOOL_CALLS` for that vertical's runs) — not a fixed schema, room for more per-vertical tool/model parameters later. |
-| `created_at` | `TIMESTAMPTZ` | Set once at insert. |
-
-Unique on `(vertical, version)`; indexed on `(vertical, version DESC)` (`idx_vertical_agent_templates_lookup`) for `get_latest_template()`'s query shape. Staff-editable directly (`frameworks/vertical_templates.py::ingest_template`) — no separate review/ingestion pipeline, since this is this project's own configuration, not Blu Mountain's authored content.
-
-## `client_agent_instances`
-
-Added alongside `vertical_agent_templates` above, same change. The genuinely new per-client artifact this change introduces: one persisted, versioned agent instance per client, built from that client's vertical's current template plus that client's own injected documentation. Superseded the prior design's "context assembled fresh on every run, nothing persisted" model — this table is a durable, independently-editable per-client record now.
-
-| Column | Type | Notes |
-| :-- | :-- | :-- |
-| `id` | `SERIAL` (PK) | |
-| `hub_id` | `TEXT` (`REFERENCES tenants(hub_id) ON DELETE CASCADE`) | Isolation is structural, matching `tenant_onboarding_profiles`: every read/write in `frameworks/client_agent.py` enforces `hub_id` directly in the query, never a Python-level check a caller could skip. |
-| `vertical_template_id` | `INTEGER` (`REFERENCES vertical_agent_templates(id)`) | A real FK to the exact template version this instance was built from — not a copied `(vertical, version)` pair — so an instance is always traceable to precisely one template row, even after that vertical's template is later updated. |
-| `version` | `INTEGER` | Append-only per `hub_id`, same versioned-snapshot philosophy as everywhere else in this project — a new instance is always a new row, never a mutation, so an in-flight run keeps using the version it started with. |
-| `injected_documentation` | `TEXT` | A rendered snapshot of this client's onboarding-profile confirmed-relevant fields (same content shape as the prior ephemeral `pull_agent._client_context_block`, now persisted instead of recomputed on every run) — taken at production time, not a live join. |
-| `created_at` | `TIMESTAMPTZ` | Set once at insert. |
-
-Indexed on `(hub_id, created_at DESC)` (`idx_client_agent_instances_hub_id`) for `get_latest_client_agent_instance()`'s query shape. Produced by `frameworks/client_agent.py::produce_client_agent_instance()`, which refuses to run for a tenant with no known vertical (matching `produce_onboarding_profile`'s existing refusal posture) and refuses if the resolved vertical has no `vertical_agent_templates` row yet. `frameworks/pull_agent.py::run_client_agent(hub_id)` (replacing the old `run_pull_agent(hub_id, vertical)`) resolves — and produces on first use — the instance for every run.
+`vertical_agent_templates` and `client_agent_instances` existed briefly (`openspec/changes/separate-vertical-client-agents`, 2026-09-01) and were dropped entirely by `openspec/changes/client-vertical-agent-classes` (2026-09-04) — a further, deliberate reversal: a vertical's and a client's agent configuration is now real, version-controlled Python code (`gateway/frameworks/agents/`), not a persisted, versioned database row. See `context/VERTICAL_AGENT_CLASSES.md` and `context/CLIENT_AGENT_CLASSES.md` for how that configuration is actually created, edited, and "saved" now (a commit and a deploy, not a runtime write).
 
 ## Locking (not a table)
 
@@ -208,5 +182,5 @@ Per-tenant refresh serialization (SC-4) uses `pg_advisory_xact_lock(hashtext(hub
 
 - **Every tenant-scoped table keys on `hub_id` as plain `TEXT`**, not a surrogate integer ID — this is deliberate: `hub_id` is externally meaningful (it's HubSpot's own identifier) and appears in every log line, audit entry, and API response as-is, so there's no separate internal-ID-to-`hub_id` mapping to keep in sync anywhere.
 - **Encryption at rest is scoped to exactly two columns**: `tokens.encrypted_access_token`/`encrypted_refresh_token` — the one vaulted credential, AES-256/HKDF, distinct per-tenant derived keys. Nothing else in this schema is encrypted at the column level — `staff_tenant_restrictions`, `audit_log`, etc. are plain text, which is fine since none of them hold a credential. (Formerly four columns, `mcp_tokens` included — dropped as part of the REST pivot, see that table's own note above.)
-- **Nothing in this schema is ever hard-deleted except via the two explicit purges** described above (`oauth_states` on successful callback, `audit_log` via the daily scheduled retention purge) and the `ON DELETE CASCADE` chains from `tenants` — to `tokens` directly, to `tenant_onboarding_profiles` (which itself cascades to `tenant_onboarding_profile_fields`), and to `client_agent_instances`. Everything else (uninstalled tenants, old session selections, restriction rows, `analysis_content`, `vertical_agent_templates` — vertical-scoped, not tenant-scoped, so no cascade applies) is left in place indefinitely by design or by current omission — see each table's notes above for which is which.
+- **Nothing in this schema is ever hard-deleted except via the two explicit purges** described above (`oauth_states` on successful callback, `audit_log` via the daily scheduled retention purge) and the `ON DELETE CASCADE` chains from `tenants` — to `tokens` directly, and to `tenant_onboarding_profiles` (which itself cascades to `tenant_onboarding_profile_fields`). Everything else (uninstalled tenants, old session selections, restriction rows, `analysis_content`) is left in place indefinitely by design or by current omission — see each table's notes above for which is which.
 - **This schema is applied against two separate real databases**: `mcp` (via `docker compose up`'s dev stack) and `mcp_test` (created automatically by `gateway/tests/conftest.py` on first test run). They share nothing — the test suite truncates every table it touches after each test, and running it against `mcp` directly destroyed a real, verified tenant install twice in one session before this separation was added.

@@ -16,6 +16,7 @@ from .crypto import decrypt, derive_tenant_key, encrypt
 from .hubspot_oauth import router as hubspot_oauth_router
 from .security import check_rate_limit, purge_expired_audit_log, record_audit, record_audit_best_effort
 from .token_vault import (
+    TENANT_DISPLAY_NAME_SQL,
     InMemoryAccessTokenCache,
     PostgresAccessTokenCache,
     TokenVault,
@@ -36,6 +37,7 @@ __all__ = [
     "InMemoryAccessTokenCache",
     "PostgresAccessTokenCache",
     "TokenVault",
+    "TENANT_DISPLAY_NAME_SQL",
     "get_installed_hub_ids",
     "vault",
     "token_vault_router",

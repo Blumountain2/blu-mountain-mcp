@@ -1,7 +1,7 @@
 # gateway-package-layout Specification
 
 ## Purpose
-TBD - created by archiving change restructure-folder-scaffolding. Update Purpose after archive.
+The gateway service's own code organization — subpackages by concern (`auth/`, `sync/`, `webhooks/`, `session/`), infrastructure modules kept at the package root, each subpackage's public surface expressed through its own `__init__.py`, and tests mirroring that same structure — with no behavioral change expected from the layout itself.
 ## Requirements
 ### Requirement: Gateway subpackage structure
 The gateway service SHALL organize production domain modules into four functional subpackages within `gateway/`: `auth/`, `sync/`, `webhooks/`, and `session/`. Each subpackage SHALL contain only the modules belonging to its subsystem.
@@ -64,4 +64,15 @@ The restructure SHALL NOT change any API route, request/response contract, exter
 #### Scenario: All tests pass after each subpackage move
 - **WHEN** `pytest` is run immediately after moving each subpackage
 - **THEN** all tests pass with no new failures
+
+### Requirement: Internal duplication may be removed without changing behavior
+Real, verified code duplication SHALL be collapsible into a shared implementation at any time, provided the full existing test suite passes unchanged and no external behavior (API routes, request/response shape, tool surface) changes as a result. A cleanup pass MAY declare specific areas of the codebase explicitly out of scope, and MUST respect that boundary — no file inside a declared-excluded area is read, edited, or removed by that pass.
+
+#### Scenario: A deduplication refactor changes no external behavior
+- **WHEN** a duplicated pattern is collapsed into one shared implementation
+- **THEN** the full existing test suite passes with no new failures and no test itself needed to change to accommodate the refactor
+
+#### Scenario: An explicitly-excluded area is left untouched
+- **WHEN** a cleanup pass declares a specific directory or module out of scope
+- **THEN** no file under that path is modified, added, or removed by that pass
 

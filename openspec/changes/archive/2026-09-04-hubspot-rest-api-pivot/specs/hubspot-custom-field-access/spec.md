@@ -3,7 +3,7 @@
 ### Requirement: If the existing pull path omits custom properties, an explicit access mechanism is added
 The system SHALL discover and pull custom properties via REST's `GET /crm/v3/properties/{objectType}` endpoint, and SHALL pass any such call through the same hand-enumerated REST endpoint allowlist as every other read path in this project.
 
-#### Scenario: A custom-field mechanism still enforces the existing read-only allowlist
+#### Scenario: A newly-added custom-field mechanism still enforces the existing read-only allowlist
 - **WHEN** a custom-field discovery or pull mechanism is used
 - **THEN** every call it makes goes through the same hand-enumerated, read-only REST endpoint allowlist enforced for every other HubSpot access path in this project
 

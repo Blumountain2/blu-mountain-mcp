@@ -59,10 +59,13 @@ async def resolve_vertical_or_raise(
     allow_unqualified: bool,
     purpose: str,
 ) -> str | None:
-    """Shared by `onboarding.produce_onboarding_profile` and
-    `client_agent.produce_client_agent_instance` — both need the identical
-    "explicit argument, else the tenant's own stored vertical, else refuse"
-    resolution, previously duplicated verbatim in each. Returns the
+    """Used by `onboarding.produce_onboarding_profile` for the
+    "explicit argument, else the tenant's own stored vertical, else
+    refuse" resolution. (Previously also shared with
+    `client_agent.produce_client_agent_instance`, removed by
+    openspec/changes/client-vertical-agent-classes — a client's vertical
+    is now fixed by which class it subclasses, not resolved at call
+    time.) Returns the
     resolved vertical (possibly None, only when `allow_unqualified=True`
     and nothing resolved). `purpose` is a short phrase describing what the
     vertical determines (e.g. "how this client's data is interpreted"),

@@ -3,14 +3,6 @@ Blu Mountain's own-authored vertical frameworks, operational skill, and
 runtime prompt (see openspec/changes/analysis-model-templates/). This
 subpackage ingests and serves that content; it does not author it."""
 
-from .client_agent import (
-    ClientAgentInstance,
-    get_instance_for_tenant,
-    get_latest_client_agent_instance,
-    produce_client_agent_instance,
-    resolve_client_agent_instance,
-    resolve_template_for_instance,
-)
 from .guidance import FRAMEWORK_PROPERTY_GUIDANCE
 from .ingest import FILE_MAP, ingest_directory
 from .onboarding import (
@@ -44,14 +36,6 @@ from .store import (
     list_latest,
 )
 from .vertical import KNOWN_VERTICALS, get_tenant_vertical, set_tenant_vertical
-from .vertical_templates import (
-    VerticalAgentTemplate,
-    get_latest_template,
-    get_template_by_id,
-    get_template_version,
-    ingest_template,
-    list_latest_templates,
-)
 
 __all__ = [
     "CONTENT_TYPE_FRAMEWORK",
@@ -85,16 +69,4 @@ __all__ = [
     "KNOWN_VERTICALS",
     "get_tenant_vertical",
     "set_tenant_vertical",
-    "VerticalAgentTemplate",
-    "get_latest_template",
-    "get_template_by_id",
-    "get_template_version",
-    "ingest_template",
-    "list_latest_templates",
-    "ClientAgentInstance",
-    "get_instance_for_tenant",
-    "get_latest_client_agent_instance",
-    "produce_client_agent_instance",
-    "resolve_client_agent_instance",
-    "resolve_template_for_instance",
 ]

@@ -30,8 +30,8 @@
 
 Both items are about content this project already stores and serves; neither depends on, nor is blocked by, the scope decision in Section 6 below (design.md's Decisions, reconfirmed 2026-08-27).
 
-- [ ] 5.1 Decide whether the six "Challenge Library" documents need reformatting into real Claude Skill-format bodies, or are fine as reference-only catalogs the operational skill loads as context. Needs a decision, not an assumption (design.md's Open Questions). Current lean, not yet confirmed by Blu Mountain: keep as-is (see design.md).
-- [ ] 5.2 Define a validation/testing methodology for the frameworks and skill. Confirmed unsolved even in Blu Mountain's own documentation ("Notes on Future Refinement" flags this as pending on their end) — likely needs a decision from Blu Mountain's strategy side, not something this project can resolve unilaterally.
+- [x] 5.1 **Resolved 2026-09-04, decided directly by the user**: keep the six Challenge Library documents as-is, no reformatting into Claude Skill-format bodies. Everything built against them (the operational skill, the vertical agent templates) is already built from their current, as-delivered state.
+- [ ] 5.2 **Deliberately archived while still open — user decision 2026-09-04.** A validation/testing methodology for whether the frameworks' real-world guidance is actually accurate remains genuinely unsolved (this project cannot resolve it unilaterally; it needs Blu Mountain's own strategy side, per the outcome-correlation work their own `Blu_Operating_Principles.md` names as pending). Explicit decision: proceed with archiving now rather than block the whole `vertical-pull-agent` capability chain on this, and revisit specifically if Blu Mountain later determines a framework's guidance isn't accurate. Not resolved, not silently treated as resolved — left unchecked on purpose.
 
 ## 6. Out of scope for this project — not deferred, not scheduled
 

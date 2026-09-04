@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import structlog
 
+from auth import TENANT_DISPLAY_NAME_SQL
 from db import get_pool
 
 from .profiling import profile_tenant_fields
@@ -54,12 +55,12 @@ class OnboardingProfile:
 
 
 async def _effective_tenant_name(hub_id: str) -> str:
-    """Same resolution order already used for the live session:
-    portal_name -> hub_domain -> hub_id, blank values treated as absent."""
+    """Same resolution order already used for the live session and the
+    debug API (`auth.token_vault.TENANT_DISPLAY_NAME_SQL`): portal_name ->
+    hub_domain -> hub_id, blank values treated as absent."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        "SELECT COALESCE(NULLIF(TRIM(portal_name), ''), NULLIF(TRIM(hub_domain), ''), hub_id) AS name "
-        "FROM tenants WHERE hub_id = $1",
+        f"SELECT {TENANT_DISPLAY_NAME_SQL} AS name FROM tenants WHERE hub_id = $1",
         hub_id,
     )
     if row is None:
@@ -111,23 +112,31 @@ async def produce_onboarding_profile(
                 name,
                 vertical,
             )
-            for object_type, field_profiles in profiled.items():
-                for fp in field_profiles:
-                    if not fp.populated:
-                        continue
-                    status = STATUS_CONFIRMED_RELEVANT if fp.framework_guidance is not None else STATUS_NEEDS_REVIEW
-                    await conn.execute(
-                        """
-                        INSERT INTO tenant_onboarding_profile_fields
-                            (profile_id, object_type, property_name, status, framework_guidance)
-                        VALUES ($1, $2, $3, $4, $5)
-                        """,
-                        profile_id,
-                        object_type,
-                        fp.name,
-                        status,
-                        fp.framework_guidance,
-                    )
+            # One batched insert instead of one round trip per populated
+            # field — a tenant can have hundreds of real properties across
+            # its object types (CLAUDE.md: "hundreds of fields, including
+            # custom ones" for a single object type alone).
+            field_rows = [
+                (
+                    profile_id,
+                    object_type,
+                    fp.name,
+                    STATUS_CONFIRMED_RELEVANT if fp.framework_guidance is not None else STATUS_NEEDS_REVIEW,
+                    fp.framework_guidance,
+                )
+                for object_type, field_profiles in profiled.items()
+                for fp in field_profiles
+                if fp.populated
+            ]
+            if field_rows:
+                await conn.executemany(
+                    """
+                    INSERT INTO tenant_onboarding_profile_fields
+                        (profile_id, object_type, property_name, status, framework_guidance)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    field_rows,
+                )
 
     logger.info(
         "frameworks.onboarding.profile_produced",

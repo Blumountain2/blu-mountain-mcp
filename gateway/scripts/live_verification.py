@@ -1,6 +1,9 @@
 """Systematic, non-mocked verification of the vertical/client agent
-separation work (openspec/changes/separate-vertical-client-agents) against
-real systems: real Postgres, real HubSpot portals, real Anthropic API, a
+separation work — now real, separate agent classes per vertical/client
+(openspec/changes/client-vertical-agent-classes), superseding the
+database-row-driven version this file originally verified
+(openspec/changes/separate-vertical-client-agents) — against real
+systems: real Postgres, real HubSpot portals, real Anthropic API, a
 real Client<->FastMCP transport. Nothing in this file mocks or fakes
 anything — every check either observes real state or makes a real call.
 
@@ -17,8 +20,8 @@ stack):
     docker cp gateway/scripts/live_verification.py mcp-gateway:/app/live_verification.py
     docker exec -w /app mcp-gateway python3 live_verification.py
 
-Five independent steps — one failing or not-ready doesn't stop the others.
-A summary table at the end shows PASS/FAIL/SKIP/NOT READY for all five.
+Six independent steps — one failing or not-ready doesn't stop the others.
+A summary table at the end shows PASS/FAIL/SKIP/NOT READY for all six.
 """
 
 import asyncio
@@ -28,12 +31,20 @@ from unittest.mock import patch
 from fastmcp import Client
 
 from db import get_pool
-from frameworks.client_agent import resolve_client_agent_instance
+from frameworks.agents import clients as _client_agents  # noqa: F401 — registers real clients
+from frameworks.agents.registry import get_registered_agent_class, registered_hub_ids
+from frameworks.agents.verticals.ecommerce import EcommerceAgent
+from frameworks.agents.verticals.marketplace import MarketplaceAgent
+from frameworks.agents.verticals.plg import PLGAgent
+from frameworks.agents.verticals.saas import SaaSAgent
+from frameworks.agents.verticals.services_project import ServicesProjectAgent
+from frameworks.agents.verticals.transactional import TransactionalAgent
 from frameworks.pull_agent import run_client_agent
 from frameworks.vertical import KNOWN_VERTICALS
-from frameworks.vertical_templates import list_latest_templates
 from session import live_session
 from sync.hubspot_client import HubSpotDataPullClient
+
+_VERTICAL_CLASSES = [SaaSAgent, PLGAgent, MarketplaceAgent, EcommerceAgent, ServicesProjectAgent, TransactionalAgent]
 
 PORTAL_A = "148997330"
 PORTAL_B = "149094230"
@@ -73,23 +84,33 @@ def _fake_staff_token(jti: str = "live-verification-jti"):
     )
 
 
-async def step1_vertical_templates_are_real():
-    _banner("STEP 1 — Every vertical has a real, persisted agent template")
-    templates = await list_latest_templates()
-    by_vertical = {t.vertical: t for t in templates}
-    missing = sorted(KNOWN_VERTICALS - by_vertical.keys())
+async def step1_vertical_and_client_agent_classes_are_real():
+    _banner("STEP 1 — Every vertical has a real agent class; both real clients are registered")
+    covered = {c.VERTICAL for c in _VERTICAL_CLASSES}
+    missing_verticals = sorted(KNOWN_VERTICALS - covered)
+    for vertical_class in _VERTICAL_CLASSES:
+        print(f"  ok       {vertical_class.VERTICAL:20} {vertical_class.__name__}")
+    for vertical in missing_verticals:
+        print(f"  MISSING  {vertical}")
 
-    for vertical in sorted(KNOWN_VERTICALS):
-        t = by_vertical.get(vertical)
-        if t:
-            print(f"  ok       {vertical:20} v{t.version}  tool_config={t.tool_config!r}")
+    registered = registered_hub_ids()
+    expected_hub_ids = {PORTAL_A, PORTAL_B}
+    missing_clients = sorted(expected_hub_ids - registered)
+    for hub_id in sorted(expected_hub_ids):
+        if hub_id in registered:
+            cls = get_registered_agent_class(hub_id)
+            print(f"  ok       {hub_id}  {cls.__name__} ({cls.VERTICAL})")
         else:
-            print(f"  MISSING  {vertical}")
+            print(f"  MISSING  {hub_id}")
 
-    if missing:
-        results.append(("1", "Vertical templates real", "FAIL", f"missing: {missing}"))
+    if missing_verticals or missing_clients:
+        results.append(
+            ("1", "Vertical/client agent classes real", "FAIL", f"missing verticals={missing_verticals} clients={missing_clients}")
+        )
     else:
-        results.append(("1", "Vertical templates real", "PASS", f"all {len(KNOWN_VERTICALS)} verticals have a template"))
+        results.append(
+            ("1", "Vertical/client agent classes real", "PASS", f"all {len(KNOWN_VERTICALS)} verticals + both real clients registered")
+        )
 
 
 async def step2_custom_field_access_is_real():
@@ -175,7 +196,7 @@ async def step3_category_tools_real_transport():
 
 
 async def step4_client_agent_run_real_anthropic():
-    _banner("STEP 4 (optional) — Real client agent run against the real Anthropic API")
+    _banner("STEP 4 (optional) — Real client agent runs against the real Anthropic API, both real clients")
     from config import settings
 
     if not settings.anthropic_api_key:
@@ -183,14 +204,59 @@ async def step4_client_agent_run_real_anthropic():
         return
 
     try:
-        instance = await resolve_client_agent_instance(PORTAL_A)
-        print(f"  resolved client_agent_instances row id={instance.id}, version={instance.version}")
-        result = await run_client_agent(PORTAL_A)
-        total = sum(len(v) for v in result.values() if isinstance(v, list))
-        print(f"  gathered {total} real records across {list(result.keys())}")
-        results.append(("4", "Real client agent run", "PASS", f"gathered {total} real records via the real Anthropic API"))
+        totals = {}
+        for hub_id in (PORTAL_A, PORTAL_B):
+            cls = get_registered_agent_class(hub_id)
+            print(f"  running {cls.__name__} ({cls.VERTICAL}) for {hub_id}")
+            result = await run_client_agent(hub_id)
+            total = sum(len(v) for v in result.values() if isinstance(v, list))
+            totals[hub_id] = total
+            print(f"  {hub_id}: gathered {total} real records across {list(result.keys())}")
+        results.append(
+            ("4", "Real client agent run", "PASS", f"gathered real records via the real Anthropic API for both clients: {totals}")
+        )
     except Exception as exc:
         results.append(("4", "Real client agent run", "NOT READY", str(exc)[:90]))
+
+
+async def step6_custom_object_reachable_through_the_agents_own_tool_loop():
+    _banner("STEP 6 — 149094230's real custom object reached through the agent's own tool dispatch")
+    # Confirms the *new* integration point custom-object-support left
+    # unwired (BaseAgent._bind_tool_executor's list_custom_objects/
+    # pull_custom_object branches), calling the executor directly rather
+    # than waiting on the model's own unprompted judgment to discover an
+    # object neither the marketplace framework nor this client's
+    # (currently empty) CONFIRMED_FIELDS names by identifier — a genuine
+    # confirmation of the new dispatch code path against real HubSpot,
+    # distinct from (and not a substitute for) the debug API's own
+    # already-confirmed direct-call path.
+    try:
+        agent = get_registered_agent_class(PORTAL_B)()
+        gathered: dict[str, list] = {}
+        execute_tool = agent._bind_tool_executor(None, None, gathered, max_tool_calls=5)
+
+        schemas_json = await execute_tool("list_custom_objects", {})
+        print(f"  list_custom_objects -> {schemas_json}")
+        import json as _json
+
+        schemas = _json.loads(schemas_json)
+        if not schemas:
+            results.append(("6", "Custom object via agent loop", "NOT READY", "no custom object schemas discovered for 149094230"))
+            return
+
+        object_type_id = schemas[0]["objectTypeId"]
+        pull_result_json = await execute_tool("pull_custom_object", {"object_type_id": object_type_id})
+        print(f"  pull_custom_object({object_type_id!r}) -> {pull_result_json}")
+
+        records = gathered.get(object_type_id)
+        if isinstance(records, list):
+            results.append(
+                ("6", "Custom object via agent loop", "PASS", f"{len(records)} real record(s) of {object_type_id} via the agent's own tool dispatch")
+            )
+        else:
+            results.append(("6", "Custom object via agent loop", "FAIL", f"pull did not return a record list: {pull_result_json}"))
+    except Exception as exc:
+        results.append(("6", "Custom object via agent loop", "NOT READY", str(exc)[:90]))
 
 
 async def step5_two_real_portals_return_distinct_data():
@@ -233,11 +299,12 @@ async def step5_two_real_portals_return_distinct_data():
 
 
 async def main():
-    await step1_vertical_templates_are_real()
+    await step1_vertical_and_client_agent_classes_are_real()
     await step2_custom_field_access_is_real()
     await step3_category_tools_real_transport()
     await step4_client_agent_run_real_anthropic()
     await step5_two_real_portals_return_distinct_data()
+    await step6_custom_object_reachable_through_the_agents_own_tool_loop()
 
     _banner("SUMMARY")
     for step, label, status, note in results:

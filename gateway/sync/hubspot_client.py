@@ -108,6 +108,16 @@ CRM_OBJECT_REST_SLUGS = {
 # generic /crm/v3/objects/ loop.
 _NON_STANDARD_OBJECT_TYPES = {"OBJECT_LIST", "LANDING_PAGE", "BLOG_POST", "CAMPAIGN"}
 
+# Three of the four (everything except OBJECT_LIST, which is a POST with
+# its own hasMore/offset pagination shape — see _pull_lists) differ from
+# each other only by endpoint path; one shared method reads from this
+# instead of three near-identical one-line methods.
+_NON_STANDARD_OBJECT_PATHS = {
+    "CAMPAIGN": "/marketing/v3/campaigns",
+    "LANDING_PAGE": "/cms/v3/pages/landing-pages",
+    "BLOG_POST": "/cms/v3/blogs/posts",
+}
+
 # Natural-language query terms a caller (session/live_session.py's
 # category tools) might use for each type, since CRM_OBJECT_TYPES entries
 # are code-facing constants, not what a staff member would type. A naive
@@ -134,6 +144,32 @@ CRM_OBJECT_ALIASES = {
     "BLOG_POST": {"blog_post", "blog_posts", "blog post", "blog posts"},
     "CAMPAIGN": {"campaign", "campaigns"},
 }
+
+
+def resolve_object_type_aliases(text: str) -> list[str]:
+    """Every canonical `CRM_OBJECT_TYPES` name that free-text `text`
+    (case-insensitive — an exact canonical name or any alias in
+    `CRM_OBJECT_ALIASES`) matches. Shared by `debug_api.py` and
+    `session/live_session.py`, which previously each independently
+    re-derived the same free-text-to-canonical-type matching.
+    Ambiguity-preserving (returns every match, not just one) to match
+    `live_session.py`'s own existing behavior — a caller needing exactly
+    one match (`debug_api.py`) takes `[0]` with its own length check.
+
+    Checks the exact canonical name in addition to `CRM_OBJECT_ALIASES`
+    membership because they're not always the same thing — confirmed
+    directly: `OBJECT_LIST`'s own lowered form ("object_list") isn't
+    itself one of its aliases ("list"/"lists"/"segment"/"segments"), so a
+    caller literally passing "OBJECT_LIST" needs this second check to
+    match at all. Confirmed no alias string is ever shared by two
+    different canonical types, so adding this check can only ever add a
+    match, never create a false ambiguity that wasn't already possible."""
+    lowered = text.strip().lower()
+    matches = [t for t in CRM_OBJECT_TYPES if lowered in CRM_OBJECT_ALIASES.get(t, set())]
+    if lowered.upper() in CRM_OBJECT_TYPES and lowered.upper() not in matches:
+        matches.append(lowered.upper())
+    return matches
+
 
 # "teams" has no CRM_OBJECT_TYPES entry at all — its only real path is
 # the organization_details generic capability below. A free-text query
@@ -240,6 +276,34 @@ class HubSpotDataPullClient:
         access_token = await vault.get_access_token(self.hub_id)
         return {"Authorization": f"Bearer {access_token}"}
 
+    async def _resolve_client_and_headers(
+        self, client: httpx.AsyncClient | None, headers: dict | None
+    ) -> tuple[httpx.AsyncClient, dict, bool]:
+        """Shared resolve step for the leaf methods whose resolve-failure and
+        body-failure degrade to the identical value and log tag
+        (`_fetch_property_definitions`, `discover_custom_object_schemas`,
+        `pull_custom_object`, `pull_object`) — collapses their repeated
+        `owns_client = client is None; if owns_client: ... elif headers is
+        None: ...` block into one call. Returns `(client, headers,
+        owns_client)`; the caller still owns closing the client via `if
+        owns_client: await client.aclose()`, and must compute `owns_client
+        = client is None` itself *before* calling this (not from this
+        method's return value), since a raised exception here leaves the
+        caller's own `client` variable unchanged.
+
+        Deliberately not used by `pull_crm_objects`/`pull_campaign_data`:
+        both have an *asymmetric* guard today (only the owns-client branch
+        is wrapped in try/except; the `elif headers is None` branch is not),
+        so merging their resolve step behind one try/except the way this
+        helper's callers do would newly catch a failure that currently
+        propagates — a real behavior change, not just deduplication."""
+        owns_client = client is None
+        if owns_client:
+            client, headers = await self._client_for_hub()
+        elif headers is None:
+            headers = await self._headers_for(client_was_provided=True)
+        return client, headers, owns_client
+
     async def _paginate(
         self, client: httpx.AsyncClient, headers: dict, path: str, params: dict, results_key: str = "results"
     ) -> list[dict]:
@@ -324,12 +388,10 @@ class HubSpotDataPullClient:
                             hub_id=self.hub_id,
                             object_type=object_type,
                         )
-                    if object_type == "CAMPAIGN":
-                        return object_type, await self._pull_campaigns_as_records(client, headers)
-                    if object_type == "LANDING_PAGE":
-                        return object_type, await self._pull_landing_pages(client, headers)
-                    if object_type == "BLOG_POST":
-                        return object_type, await self._pull_blog_posts(client, headers)
+                    if object_type in _NON_STANDARD_OBJECT_PATHS:
+                        return object_type, await self._pull_non_standard_object(
+                            _NON_STANDARD_OBJECT_PATHS[object_type], client, headers
+                        )
                     if object_type == "OBJECT_LIST":
                         return object_type, await self._pull_lists(client, headers)
                     raise KeyError(
@@ -394,22 +456,14 @@ class HubSpotDataPullClient:
         by a CRM_OBJECT_REST_SLUGS slug) and discover_custom_object_properties
         (custom objects, keyed by a runtime-discovered objectTypeId) —
         REST's properties endpoint works identically either way, confirmed
-        live (openspec/changes/custom-object-support)."""
+        live (openspec/changes/custom-object-support). A token-fetch
+        failure (e.g. an unknown/never-installed tenant) degrades to []
+        the same way an HTTP-level failure does — never propagates
+        uncaught out of a method whose whole contract is "never crash,
+        just return what it can.\""""
         owns_client = client is None
         try:
-            if owns_client:
-                client, headers = await self._client_for_hub()
-            elif headers is None:
-                headers = await self._headers_for(client_was_provided=True)
-        except Exception as exc:
-            # A token-fetch failure (e.g. an unknown/never-installed
-            # tenant) is just as much a "this discovery attempt failed"
-            # case as an HTTP-level failure below — must degrade to []
-            # the same way, not propagate uncaught out of a method whose
-            # whole contract is "never crash, just return what it can."
-            self.log_pull_failure(log_tool_name, exc)
-            return []
-        try:
+            client, headers, owns_client = await self._resolve_client_and_headers(client, headers)
             response = await client.get(
                 f"{HUBSPOT_API_BASE}/crm/v3/properties/{slug_or_object_type_id}", headers=headers
             )
@@ -424,7 +478,7 @@ class HubSpotDataPullClient:
             self.log_pull_failure(log_tool_name, exc)
             return []
         finally:
-            if owns_client:
+            if owns_client and client is not None:
                 await client.aclose()
 
     # --- custom objects: runtime-discovered, never a fixed slug
@@ -445,17 +499,11 @@ class HubSpotDataPullClient:
         to `[]` on a portal without Custom Objects access (an Enterprise-
         tier HubSpot feature) rather than raising — confirmed live the
         baseline-tier test portal can't even create a custom object at
-        all, let alone grant this scope."""
+        all, let alone grant this scope. A token-fetch failure degrades
+        the same way an HTTP-level failure does."""
         owns_client = client is None
         try:
-            if owns_client:
-                client, headers = await self._client_for_hub()
-            elif headers is None:
-                headers = await self._headers_for(client_was_provided=True)
-        except Exception as exc:
-            self.log_pull_failure("custom_object_schemas", exc)
-            return []
-        try:
+            client, headers, owns_client = await self._resolve_client_and_headers(client, headers)
             response = await client.get(f"{HUBSPOT_API_BASE}/crm-object-schemas/v3/schemas", headers=headers)
             response.raise_for_status()
             body = response.json()
@@ -472,7 +520,7 @@ class HubSpotDataPullClient:
             self.log_pull_failure("custom_object_schemas", exc)
             return []
         finally:
-            if owns_client:
+            if owns_client and client is not None:
                 await client.aclose()
 
     async def pull_custom_object(
@@ -496,14 +544,7 @@ class HubSpotDataPullClient:
             return {"error": "pull_failed"}
         owns_client = client is None
         try:
-            if owns_client:
-                client, headers = await self._client_for_hub()
-            elif headers is None:
-                headers = await self._headers_for(client_was_provided=True)
-        except Exception as exc:
-            self.log_pull_failure(f"custom_object:{object_type_id}", exc)
-            return {"error": "pull_failed"}
-        try:
+            client, headers, owns_client = await self._resolve_client_and_headers(client, headers)
             params = {"limit": 100}
             safe_properties = [p for p in (properties or []) if _is_safe_property_name(p)]
             if safe_properties:
@@ -513,7 +554,7 @@ class HubSpotDataPullClient:
             self.log_pull_failure(f"custom_object:{object_type_id}", exc)
             return {"error": "pull_failed"}
         finally:
-            if owns_client:
+            if owns_client and client is not None:
                 await client.aclose()
 
     async def discover_custom_object_properties(
@@ -532,23 +573,18 @@ class HubSpotDataPullClient:
 
     # --- non-standard object families ---
 
-    async def _pull_campaigns_as_records(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
-        """Marketing Campaigns API (`/marketing/v3/campaigns`) — a
-        genuinely different shape from the CRM Objects API. Account-tier
-        gating (Campaigns requires a paid marketing tier) degrades
-        gracefully here the same way the prior MCP-based path did: a
-        real 403/401 from HubSpot on a non-Enterprise portal is caught by
-        pull_crm_objects()'s own outer try/except, not specially handled
-        here."""
-        return await self._paginate(client, headers, "/marketing/v3/campaigns", {"limit": 100})
-
-    async def _pull_landing_pages(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
-        """HubSpot's CMS API for landing pages."""
-        return await self._paginate(client, headers, "/cms/v3/pages/landing-pages", {"limit": 100})
-
-    async def _pull_blog_posts(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
-        """HubSpot's CMS API for blog posts."""
-        return await self._paginate(client, headers, "/cms/v3/blogs/posts", {"limit": 100})
+    async def _pull_non_standard_object(self, path: str, client: httpx.AsyncClient, headers: dict) -> list[dict]:
+        """Shared GET+paginate for the non-standard object families whose
+        only difference from each other is the endpoint path (Marketing
+        Campaigns, CMS landing pages, CMS blog posts — see
+        `_NON_STANDARD_OBJECT_PATHS`). Account-tier gating (e.g. Campaigns
+        requiring a paid marketing tier) degrades gracefully here the same
+        way the prior MCP-based path did: a real 403/401 from HubSpot is
+        caught by `pull_crm_objects()`'s own outer try/except, not
+        specially handled here. `OBJECT_LIST` stays its own method
+        (`_pull_lists`) — a POST with its own hasMore/offset pagination
+        shape, not this GET+cursor one."""
+        return await self._paginate(client, headers, path, {"limit": 100})
 
     async def _pull_lists(self, client: httpx.AsyncClient, headers: dict) -> list[dict]:
         """HubSpot's Lists API. Its own "search" operation is a POST (filter
@@ -634,12 +670,17 @@ class HubSpotDataPullClient:
 
     # --- generic capabilities (formerly MCP's dynamic tools) ---
 
-    async def list_read_only_tools(self, client: httpx.AsyncClient | None = None) -> list[str]:
+    @staticmethod
+    async def list_read_only_tools(client: httpx.AsyncClient | None = None) -> list[str]:
         """Returns this project's fixed, hand-maintained set of generic
         read capability names — the REST-era replacement for the prior
         MCP-based dynamic tool discovery. No live discovery call is made;
         REST's endpoint set is known ahead of time, so what's "available"
-        is simply what this module implements."""
+        is simply what this module implements. Never reads `self.hub_id`
+        (there is no `self`) — a `@staticmethod` since this doesn't need
+        a tenant-scoped instance at all; `client` stays accepted, unused,
+        purely so existing instance-style call sites that pass one for
+        connection-reuse consistency don't need to change."""
         return list(_GENERIC_CAPABILITIES.keys())
 
     async def pull_object(
@@ -660,20 +701,13 @@ class HubSpotDataPullClient:
 
         owns_client = client is None
         try:
-            if owns_client:
-                client, headers = await self._client_for_hub()
-            elif headers is None:
-                headers = await self._headers_for(client_was_provided=True)
-        except Exception as exc:
-            self.log_pull_failure(tool_name, exc)
-            return {"error": "pull_failed"}
-        try:
+            client, headers, owns_client = await self._resolve_client_and_headers(client, headers)
             return await capability(self, client, headers, **params)
         except Exception as exc:
             self.log_pull_failure(tool_name, exc)
             return {"error": "pull_failed"}
         finally:
-            if owns_client:
+            if owns_client and client is not None:
                 await client.aclose()
 
     async def _owners(self, client: httpx.AsyncClient, headers: dict, **_params) -> list[dict]:

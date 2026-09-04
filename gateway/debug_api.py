@@ -18,14 +18,14 @@ read methods, never a new access mechanism of its own.
 
 from fastapi import APIRouter, Header, HTTPException
 
-from auth import record_audit
+from auth import TENANT_DISPLAY_NAME_SQL, get_installed_hub_ids, record_audit
 from config import settings
 from db import get_pool
 from sync.hubspot_client import (
-    CRM_OBJECT_ALIASES,
     CRM_OBJECT_TYPES,
     HubSpotDataPullClient,
     ReadOnlyViolation,
+    resolve_object_type_aliases,
 )
 
 router = APIRouter(prefix="/debug/hubspot", tags=["debug"])
@@ -39,28 +39,40 @@ def _require_api_key(x_debug_api_key: str | None) -> None:
 def _resolve_object_type(object_type: str) -> str:
     """Accepts either the exact CRM_OBJECT_TYPES name (any casing) or any
     of its free-text aliases (e.g. "contacts", "line items") — the same
-    alias table session/live_session.py's query tools already use, so a
+    shared resolver session/live_session.py's query tools use, so a
     Postman caller doesn't need to know the exact ALL_CAPS/singular
     constant names (CONTACT, MEETING_EVENT, etc.) to use this API."""
-    lowered = object_type.strip().lower()
-    if lowered.upper() in CRM_OBJECT_TYPES:
-        return lowered.upper()
-    for type_name, aliases in CRM_OBJECT_ALIASES.items():
-        if lowered in aliases:
-            return type_name
-    raise HTTPException(400, f"Unknown object_type {object_type!r}; see GET /debug/hubspot/object-types")
+    matches = resolve_object_type_aliases(object_type)
+    if not matches:
+        raise HTTPException(400, f"Unknown object_type {object_type!r}; see GET /debug/hubspot/object-types")
+    return matches[0]
+
+
+def _parse_properties_param(properties: str | None) -> list[str] | None:
+    """Parses the `?properties=a,b,c` query param shared by every route
+    here that narrows a pull to specific fields — blank entries dropped.
+    Returns `None` only when `properties` itself is `None`/empty (matches
+    each call site's prior inline behavior exactly, including the edge
+    case of an all-blank value like "," or ",,," returning `[]`, not
+    `None` — that distinction doesn't change pull behavior downstream
+    (both are falsy to `properties or []`) but does change what value
+    lands in the audit log's own recorded detail, so it's preserved)."""
+    if not properties:
+        return None
+    return [p.strip() for p in properties.split(",") if p.strip()]
 
 
 async def _require_installed_tenant(hub_id: str) -> None:
     """404s for any hub_id that isn't a real, currently-installed tenant —
     this is the actual per-request scoping (not a hardcoded test-hub_id
     allowlist): only real installs are ever reachable, by construction,
-    the same way every other caller of HubSpotDataPullClient is scoped."""
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT 1 FROM tenants WHERE hub_id = $1 AND install_status = 'installed'", hub_id
-    )
-    if row is None:
+    the same way every other caller of HubSpotDataPullClient is scoped.
+    Checked against `get_installed_hub_ids()` — this project's single
+    source of truth for "which tenants are active," already shared by
+    the scheduled sync and the live session, so this becomes a third
+    consumer of the same predicate instead of a fourth hand-written copy
+    of it."""
+    if hub_id not in await get_installed_hub_ids():
         raise HTTPException(404, f"{hub_id!r} is not a currently-installed tenant")
 
 
@@ -68,14 +80,14 @@ async def _require_installed_tenant(hub_id: str) -> None:
 async def list_tenants(x_debug_api_key: str | None = Header(default=None)) -> list[dict]:
     """Every currently-installed tenant, with its display name — the
     starting point for picking a hub_id to use in every other endpoint
-    below. Same name-fallback chain as the live session's own
-    list_my_tenants (COALESCE(portal_name, hub_domain, hub_id))."""
+    below. Same shared name-fallback chain as the live session's own
+    list_my_tenants (`auth.TENANT_DISPLAY_NAME_SQL`)."""
     _require_api_key(x_debug_api_key)
     pool = await get_pool()
     rows = await pool.fetch(
-        """
+        f"""
         SELECT hub_id,
-               COALESCE(NULLIF(TRIM(portal_name), ''), NULLIF(TRIM(hub_domain), ''), hub_id) AS name
+               {TENANT_DISPLAY_NAME_SQL} AS name
         FROM tenants
         WHERE install_status = 'installed'
         ORDER BY hub_id
@@ -93,7 +105,7 @@ async def list_object_types(x_debug_api_key: str | None = Header(default=None)) 
     _require_api_key(x_debug_api_key)
     return {
         "crm_object_types": CRM_OBJECT_TYPES,
-        "capabilities": await HubSpotDataPullClient("").list_read_only_tools(),
+        "capabilities": await HubSpotDataPullClient.list_read_only_tools(),
     }
 
 
@@ -113,7 +125,7 @@ async def pull_crm_object_type(
     await _require_installed_tenant(hub_id)
     normalized_type = _resolve_object_type(object_type)
 
-    requested_properties = [p.strip() for p in properties.split(",") if p.strip()] if properties else None
+    requested_properties = _parse_properties_param(properties)
     properties_map = {normalized_type: requested_properties} if requested_properties else None
 
     client = HubSpotDataPullClient(hub_id)
@@ -193,7 +205,7 @@ async def pull_custom_object_records(
     _require_api_key(x_debug_api_key)
     await _require_installed_tenant(hub_id)
 
-    requested_properties = [p.strip() for p in properties.split(",") if p.strip()] if properties else None
+    requested_properties = _parse_properties_param(properties)
 
     client = HubSpotDataPullClient(hub_id)
     result = await client.pull_custom_object(object_type_id, properties=requested_properties)
