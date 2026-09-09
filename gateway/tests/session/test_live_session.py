@@ -560,6 +560,221 @@ async def test_query_crm_records_never_matches_a_generic_tool_from_another_categ
     assert result == {}
 
 
+@pytest.mark.asyncio
+async def test_list_custom_objects_returns_real_schemas(monkeypatch):
+    """Custom objects (task 4/5, gateway/scripts/generate_confirmed_fields.py
+    conversation, 2026-09-08) have no fixed lookup table the way standard
+    CRM object types do — a caller must discover a tenant's real schemas
+    first, the same "list, then pull by objectTypeId" shape debug_api.py's
+    /custom-objects routes and BaseAgent's list_custom_objects/
+    pull_custom_object tool pair already use."""
+    await _seed_single_tenant(
+        "hub_live_custom_schemas",
+        monkeypatch,
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": lambda params: _resp(
+                200,
+                {"results": [{"objectTypeId": "2-3465404", "name": "transaction", "labels": {"singular": "Transaction"}}]},
+            )
+        },
+    )
+
+    result = await live_session.list_custom_objects()
+
+    assert result == [{"objectTypeId": "2-3465404", "name": "transaction", "labels": {"singular": "Transaction"}}]
+
+
+def _custom_schemas_handler(schemas: list[dict]):
+    return lambda params: _resp(200, {"results": schemas})
+
+
+_TXN_SCHEMA = {"objectTypeId": "2-3465404", "name": "transaction", "labels": {"singular": "Transaction", "plural": "Transactions"}}
+
+
+@pytest.mark.asyncio
+async def test_query_custom_object_returns_real_records_by_exact_object_type_id(monkeypatch):
+    await _seed_single_tenant(
+        "hub_live_custom_pull",
+        monkeypatch,
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA]),
+            "/crm/v3/objects/2-3465404": lambda params: _page([{"id": "txn-1", "properties": {}}]),
+        },
+    )
+
+    result = await live_session.query_custom_object("2-3465404")
+
+    assert result == {"object_type_id": "2-3465404", "records": [{"id": "txn-1", "properties": {}}]}
+
+
+@pytest.mark.asyncio
+async def test_query_custom_object_resolves_a_friendly_name(monkeypatch):
+    """No fixed alias table for custom objects (unlike standard CRM object
+    types) — resolution always goes through this tenant's own real, live
+    schema data instead, matched case-insensitively against name/labels."""
+    await _seed_single_tenant(
+        "hub_live_custom_name",
+        monkeypatch,
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA]),
+            "/crm/v3/objects/2-3465404": lambda params: _page([{"id": "txn-1", "properties": {}}]),
+        },
+    )
+
+    result = await live_session.query_custom_object("Transactions")
+
+    assert result == {"object_type_id": "2-3465404", "records": [{"id": "txn-1", "properties": {}}]}
+
+
+@pytest.mark.asyncio
+async def test_query_custom_object_ambiguous_name_returns_candidates_not_a_guess(monkeypatch):
+    other_schema = {"objectTypeId": "2-9999999", "name": "transaction_v2", "labels": {"singular": "Transaction", "plural": "Transactionz"}}
+    await _seed_single_tenant(
+        "hub_live_custom_ambiguous",
+        monkeypatch,
+        get_handlers={"/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA, other_schema])},
+    )
+
+    result = await live_session.query_custom_object("Transaction")
+
+    assert result["ambiguous"] is True
+    assert {c["objectTypeId"] for c in result["candidates"]} == {"2-3465404", "2-9999999"}
+
+
+@pytest.mark.asyncio
+async def test_query_custom_object_no_match_returns_a_clear_error(monkeypatch):
+    await _seed_single_tenant(
+        "hub_live_custom_no_match",
+        monkeypatch,
+        get_handlers={"/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA])},
+    )
+
+    result = await live_session.query_custom_object("Nonexistent Object")
+
+    assert "error" in result
+    assert "records" not in result
+
+
+@pytest.mark.asyncio
+async def test_query_custom_object_can_be_scoped_to_explicit_properties(monkeypatch):
+    """Mirrors test_query_crm_records_can_be_scoped_to_explicit_properties —
+    the same explicit-narrowing behavior, for a custom object's own
+    properties endpoint."""
+    seen_params = {}
+
+    def handler(params):
+        seen_params["txn"] = params
+        return _page([{"id": "txn-1", "properties": {}}])
+
+    await _seed_single_tenant(
+        "hub_live_custom_props",
+        monkeypatch,
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA]),
+            "/crm/v3/objects/2-3465404": handler,
+        },
+    )
+
+    await live_session.query_custom_object("2-3465404", properties=["status", "amount"])
+
+    assert seen_params["txn"]["properties"] == "status,amount"
+
+
+@pytest.mark.asyncio
+async def test_list_custom_objects_never_constructs_a_client_for_a_restricted_tenant(monkeypatch):
+    """Same isolation guarantee as test_query_users_never_constructs_a_client_for_a_restricted_tenant,
+    proven for the new custom-object tools specifically — the actual
+    HubSpot-pulling client is only ever constructed for the permitted
+    tenant."""
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO tenants (hub_id, install_status) VALUES ($1, 'installed')",
+        "hub_custom_leak_restricted",
+    )
+    await pool.execute(
+        "INSERT INTO tenants (hub_id, install_status) VALUES ($1, 'installed')",
+        "hub_custom_leak_allowed",
+    )
+    await pool.execute(
+        "INSERT INTO staff_tenant_restrictions (staff_identity, hub_id) VALUES ($1, $2)",
+        "custom-leak-check@blumountain.me", "hub_custom_leak_restricted",
+    )
+    monkeypatch.setattr(
+        live_session, "get_access_token", lambda: _fake_token("custom-leak-check@blumountain.me")
+    )
+    monkeypatch.setattr(live_session, "record_audit", AsyncMock())
+
+    constructed_hub_ids = []
+    real_init = HubSpotDataPullClient.__init__
+
+    def _recording_init(self, hub_id):
+        constructed_hub_ids.append(hub_id)
+        real_init(self, hub_id)
+
+    monkeypatch.setattr(HubSpotDataPullClient, "__init__", _recording_init)
+
+    async def fake_client_for_hub(self):
+        return _FakeAsyncClient(get_handlers={"/crm-object-schemas/v3/schemas": lambda params: _page([])}), {
+            "Authorization": "Bearer access-token"
+        }
+
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
+
+    await live_session.list_custom_objects()
+
+    assert constructed_hub_ids == ["hub_custom_leak_allowed"]
+    assert "hub_custom_leak_restricted" not in constructed_hub_ids
+
+
+@pytest.mark.asyncio
+async def test_query_custom_object_never_constructs_a_client_for_a_restricted_tenant(monkeypatch):
+    """Same isolation guarantee, proven for query_custom_object specifically —
+    not just its sibling list_custom_objects. query_custom_object makes two
+    real HubSpot calls internally (resolve, then pull); both must only ever
+    happen against the permitted tenant."""
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO tenants (hub_id, install_status) VALUES ($1, 'installed')",
+        "hub_custom_pull_leak_restricted",
+    )
+    await pool.execute(
+        "INSERT INTO tenants (hub_id, install_status) VALUES ($1, 'installed')",
+        "hub_custom_pull_leak_allowed",
+    )
+    await pool.execute(
+        "INSERT INTO staff_tenant_restrictions (staff_identity, hub_id) VALUES ($1, $2)",
+        "custom-pull-leak-check@blumountain.me", "hub_custom_pull_leak_restricted",
+    )
+    monkeypatch.setattr(
+        live_session, "get_access_token", lambda: _fake_token("custom-pull-leak-check@blumountain.me")
+    )
+    monkeypatch.setattr(live_session, "record_audit", AsyncMock())
+
+    constructed_hub_ids = []
+    real_init = HubSpotDataPullClient.__init__
+
+    def _recording_init(self, hub_id):
+        constructed_hub_ids.append(hub_id)
+        real_init(self, hub_id)
+
+    monkeypatch.setattr(HubSpotDataPullClient, "__init__", _recording_init)
+
+    async def fake_client_for_hub(self):
+        return _FakeAsyncClient(
+            get_handlers={
+                "/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA]),
+                "/crm/v3/objects/2-3465404": lambda params: _page([{"id": "txn-1", "properties": {}}]),
+            }
+        ), {"Authorization": "Bearer access-token"}
+
+    monkeypatch.setattr(HubSpotDataPullClient, "_client_for_hub", fake_client_for_hub)
+
+    await live_session.query_custom_object("2-3465404")
+
+    assert constructed_hub_ids == ["hub_custom_pull_leak_allowed"]
+    assert "hub_custom_pull_leak_restricted" not in constructed_hub_ids
+
+
 # Every test above calls live_session's plain async functions directly —
 # real, but it never exercises the actual MCP transport layer itself: tool
 # discovery, JSON-RPC parameter binding, or result (de)serialization. A
@@ -576,7 +791,7 @@ async def test_query_crm_records_never_matches_a_generic_tool_from_another_categ
 
 
 @pytest.mark.asyncio
-async def test_real_transport_lists_all_six_tools_with_correct_schemas(monkeypatch):
+async def test_real_transport_lists_all_eight_tools_with_correct_schemas(monkeypatch):
     """Catches a parameter-rename regression class of bug that every other
     test in this file cannot: those call Python functions directly by
     keyword, so a mismatch between the function's real parameter name and
@@ -598,6 +813,8 @@ async def test_real_transport_lists_all_six_tools_with_correct_schemas(monkeypat
         "query_engagement_records": {"object_type", "properties"},
         "query_marketing_content": {"object_type", "properties"},
         "query_users": {"object_type", "properties"},
+        "list_custom_objects": set(),
+        "query_custom_object": {"object_type", "properties"},
     }
 
 
@@ -657,6 +874,47 @@ async def test_real_transport_query_engagement_records_rejects_out_of_category_t
         result = await client.call_tool("query_engagement_records", {"object_type": "contacts"})
 
     assert "error" in result.data
+
+
+@pytest.mark.asyncio
+async def test_real_transport_list_custom_objects_round_trip(monkeypatch):
+    await _seed_single_tenant(
+        "hub_transport_custom_list",
+        monkeypatch,
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": lambda params: _resp(
+                200, {"results": [{"objectTypeId": "2-3465404", "name": "transaction", "labels": {"singular": "Transaction"}}]}
+            )
+        },
+    )
+
+    async with Client(live_session.mcp) as client:
+        result = await client.call_tool("list_custom_objects", {})
+
+    assert result.data == [{"objectTypeId": "2-3465404", "name": "transaction", "labels": {"singular": "Transaction"}}]
+
+
+@pytest.mark.asyncio
+async def test_real_transport_query_custom_object_round_trip(monkeypatch):
+    """Exercises the object_type/properties parameters specifically
+    through real JSON-RPC parameter binding, not just a direct Python
+    keyword call — including resolving a friendly name, not just the
+    exact objectTypeId, over real transport."""
+    await _seed_single_tenant(
+        "hub_transport_custom_pull",
+        monkeypatch,
+        get_handlers={
+            "/crm-object-schemas/v3/schemas": _custom_schemas_handler([_TXN_SCHEMA]),
+            "/crm/v3/objects/2-3465404": lambda params: _page([{"id": "txn-1", "properties": {}}]),
+        },
+    )
+
+    async with Client(live_session.mcp) as client:
+        result = await client.call_tool(
+            "query_custom_object", {"object_type": "Transactions", "properties": ["status"]}
+        )
+
+    assert result.data == {"object_type_id": "2-3465404", "records": [{"id": "txn-1", "properties": {}}]}
 
 
 @pytest.mark.asyncio

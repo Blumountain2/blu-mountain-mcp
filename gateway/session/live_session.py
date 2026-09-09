@@ -19,6 +19,7 @@ returned. Every access is audited by staff identity and tenant.
 
 import asyncio
 
+import httpx
 import structlog
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
@@ -156,7 +157,7 @@ async def _permitted_tenants(staff_identity: str) -> list[dict]:
 
     Returns each tenant's effective display name alongside its hub_id —
     `auth.TENANT_DISPLAY_NAME_SQL` (COALESCE(portal_name, hub_domain,
-    hub_id), shared with debug_api.py/onboarding.py) computed here in SQL
+    hub_id), shared with debug_api.py) computed here in SQL
     so every caller sees a real, never-NULL name without re-deriving the
     same fallback chain in Python. Each candidate is wrapped in
     NULLIF(TRIM(...), '') first: an empty or whitespace-only string is not
@@ -188,6 +189,17 @@ async def _permitted_tenants(staff_identity: str) -> list[dict]:
 
 def _hub_ids(permitted: list[dict]) -> set[str]:
     return {t["hub_id"] for t in permitted}
+
+
+def _ambiguous_result(query: str, candidates: list[dict]) -> dict:
+    """The shared "don't guess, report every match" envelope — used by
+    select_tenant (candidates are {hub_id, name} projections) and
+    _resolve_custom_object_type_id (candidates are raw schema dicts) alike,
+    so the two independent match sources (a live tenant list vs. a live
+    custom-object schema list) don't each hand-roll the same {"ambiguous":
+    True, "query": ..., "candidates": ...} shape and risk drifting apart if
+    that contract ever changes."""
+    return {"ambiguous": True, "query": query, "candidates": candidates}
 
 
 async def _deny_tenant_access(staff_identity: str, hub_id: str, reason: str) -> None:
@@ -321,11 +333,9 @@ async def select_tenant(tenant: str) -> dict:
     if len(name_matches) > 1:
         logger.warning("live_session.tenant_selection_ambiguous", staff=email, query=tenant)
         await _audit(email, None, "live_tenant_selection_ambiguous", {"query": tenant})
-        return {
-            "ambiguous": True,
-            "query": tenant,
-            "candidates": [{"hub_id": t["hub_id"], "name": t["name"]} for t in name_matches],
-        }
+        return _ambiguous_result(
+            tenant, [{"hub_id": t["hub_id"], "name": t["name"]} for t in name_matches]
+        )
 
     await _deny_tenant_access(email, tenant, "no_match")
 
@@ -354,10 +364,10 @@ async def _query_category(category: str, object_type: str, properties: list[str]
 
     properties (task 6.3): an optional explicit column list, forwarded to
     pull_crm_objects for every matched CRM object type — this is what lets
-    a category tool be scoped to a client's own confirmed-relevant or
-    custom fields (from its onboarding profile/client agent instance),
-    rather than always returning HubSpot's small default property set.
-    Omitting it keeps today's default behavior unchanged."""
+    a category tool be scoped to specific confirmed-relevant or custom
+    fields a caller already knows matter for this client, rather than
+    always returning HubSpot's small default property set. Omitting it
+    keeps today's default behavior unchanged."""
     email, session_key = await _require_staff_identity()
     hub_id = await _resolve_selected_tenant(email, session_key)
 
@@ -463,9 +473,125 @@ async def query_users(object_type: str, properties: list[str] | None = None) -> 
     return await _query_category(CATEGORY_USERS, object_type, properties)
 
 
+@mcp.tool
+async def list_custom_objects() -> list[dict]:
+    """Lists the session's selected tenant's real custom object schemas
+    (objectTypeId, name, labels), if any — there is no fixed list of these
+    the way there is for standard CRM object types (`query_crm_records`
+    etc.): a custom object is defined per-portal, at runtime, by whoever
+    configured that client's HubSpot instance. Worth calling before
+    query_custom_object to see what's available, though query_custom_object
+    also resolves a friendly name/label on its own if you already know it.
+    Returns an empty list on a portal without Custom Objects access (an
+    Enterprise-tier HubSpot feature), not an error."""
+    email, session_key = await _require_staff_identity()
+    hub_id = await _resolve_selected_tenant(email, session_key)
+
+    client = HubSpotDataPullClient(hub_id)
+    schemas = await client.discover_custom_object_schemas()
+
+    await _audit(email, hub_id, "live_custom_object_schemas_listed", {"schema_count": len(schemas)})
+    logger.info(
+        "live_session.custom_object_schemas_listed", staff=email, hub_id=hub_id, schema_count=len(schemas)
+    )
+    return schemas
+
+
+def _matches_custom_object_query(schema: dict, query: str) -> bool:
+    # Stripped once, up front, so incidental whitespace (e.g. a tool-call
+    # argument like " 2-252820399") can't make a real, valid objectTypeId
+    # fail the exact-match branch while the name/label branch below would
+    # have tolerated the same whitespace fine.
+    stripped = query.strip()
+    if schema.get("objectTypeId") == stripped:
+        return True
+    labels = schema.get("labels") or {}
+    names = {schema.get("name") or "", labels.get("singular") or "", labels.get("plural") or ""}
+    return stripped.lower() in {n.lower() for n in names if n}
+
+
+async def _resolve_custom_object_type_id(
+    client: HubSpotDataPullClient,
+    object_type: str,
+    http_client: httpx.AsyncClient | None = None,
+    headers: dict | None = None,
+) -> dict:
+    """Resolves object_type against this tenant's real, live custom object
+    schemas — either the exact objectTypeId (from list_custom_objects) or a
+    friendly name/label ("transactions", "Transaction"), matched
+    case-insensitively. There's no fixed alias table the way
+    resolve_object_type_aliases has for standard CRM object types, since a
+    custom object's very existence and naming is tenant-specific, only
+    knowable by asking this tenant's own portal at call time — so this
+    always calls discover_custom_object_schemas() fresh rather than
+    guessing from a cached or hardcoded list.
+
+    http_client/headers: an already-resolved connection a caller (e.g.
+    query_custom_object, which also calls pull_custom_object right after
+    this) can pass through instead of this method triggering its own
+    separate vault token fetch — the same connection-reuse pattern
+    _query_category already uses. Optional so a standalone caller can
+    still let this resolve its own.
+
+    Returns {"object_type_id": ...} on exactly one match, or an
+    {"error": ...} / {"ambiguous": True, "candidates": [...]} dict a
+    caller should return directly — mirrors select_tenant's own
+    resolve-or-report-ambiguity discipline, never a silent guess."""
+    schemas = await client.discover_custom_object_schemas(client=http_client, headers=headers)
+    matches = [s for s in schemas if _matches_custom_object_query(s, object_type)]
+
+    if not matches:
+        return {"error": f"{object_type!r} does not match any of this tenant's custom objects; call list_custom_objects first"}
+    if len(matches) > 1:
+        return _ambiguous_result(object_type, matches)
+    return {"object_type_id": matches[0]["objectTypeId"]}
+
+
+@mcp.tool
+async def query_custom_object(object_type: str, properties: list[str] | None = None) -> dict:
+    """Returns read-only records for one of the session's selected tenant's
+    custom objects. Pass either the exact objectTypeId (from
+    list_custom_objects) or a friendly name — this tenant's own custom
+    object's internal name or singular/plural label (e.g. "transaction" or
+    "Transactions"), matched case-insensitively against list_custom_objects'
+    own real, live schema data — there's no fixed alias table the way
+    there is for standard CRM object types, since a custom object's very
+    existence and naming is tenant-specific, discovered at runtime. If the
+    name matches more than one of this tenant's custom objects, this does
+    NOT guess: it returns {"ambiguous": True, "candidates": [...]} instead,
+    the same as select_tenant. Optionally pass `properties` (exact HubSpot
+    internal property names) to return exactly those fields instead of
+    HubSpot's own default set, the same as every other query_* tool here."""
+    email, session_key = await _require_staff_identity()
+    hub_id = await _resolve_selected_tenant(email, session_key)
+
+    client = HubSpotDataPullClient(hub_id)
+    # One shared connection for both calls this tool makes (resolve, then
+    # pull), mirroring _query_category's own connection-reuse — without
+    # this, every query_custom_object call triggered two separate vault
+    # token fetches and two separate httpx.AsyncClients instead of one.
+    http_client, headers = await client._client_for_hub()
+    async with http_client:
+        resolved = await _resolve_custom_object_type_id(client, object_type, http_client, headers)
+        if "object_type_id" not in resolved:
+            await _audit(email, hub_id, "live_custom_object_not_resolved", {"query": object_type, **resolved})
+            return resolved
+        object_type_id = resolved["object_type_id"]
+
+        result = await client.pull_custom_object(
+            object_type_id, client=http_client, headers=headers, properties=properties
+        )
+
+    await _audit(
+        email, hub_id, "live_custom_object_query", {"object_type_id": object_type_id, "properties": properties}
+    )
+    logger.info("live_session.custom_object_query", staff=email, hub_id=hub_id, object_type_id=object_type_id)
+    return {"object_type_id": object_type_id, "records": result}
+
+
 # Prompts return static instruction text only — they never touch the vault,
 # Postgres, or HubSpot themselves. All real data access still goes through
-# select_tenant/the four category-scoped query_* tools above, so nothing here needs its own
+# select_tenant/the query_* tools above, so nothing here needs its own
 # staff-identity or tenant-permission check; a prompt can't leak anything a
 # tool call wouldn't already guard. A first, deliberately small pair, not a
 # full library — real staff usage (none exists yet, since no client is

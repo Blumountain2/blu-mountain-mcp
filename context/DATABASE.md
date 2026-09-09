@@ -18,13 +18,14 @@ exist and whether they're currently installed.
 
 | Column | Type | Notes |
 | :-- | :-- | :-- |
-| `hub_id` | `TEXT` (PK) | HubSpot's portal identifier. Primary tenant key referenced by `tokens`, `rate_limit_buckets`, `audit_log`, `staff_tenant_restrictions`, `hubspot_object_index`, `tenant_onboarding_profiles`. |
+| `hub_id` | `TEXT` (PK) | HubSpot's portal identifier. Primary tenant key referenced by `tokens`, `rate_limit_buckets`, `audit_log`, `staff_tenant_restrictions`, `hubspot_object_index`. |
 | `portal_name` | `TEXT` | Human-curated display name, set only via `/install`'s optional `?portal_name=` query param (round-tripped through `oauth_states.portal_name`) — never auto-overwritten. |
-| `hub_domain` | `TEXT` | HubSpot's own domain for the portal, auto-captured from the OAuth access-token-info response on every install/reinstall. Readers should use `COALESCE(portal_name, hub_domain, hub_id)`, never `hub_domain` alone — this is the resolution order both the live session and `frameworks/onboarding.py::_effective_tenant_name` use. |
-| `vertical` | `TEXT` | The tenant's known vertical framework (e.g. `saas`, `plg`), staff-set via `frameworks/vertical.py::set_tenant_vertical` — **never inferred automatically**. `NULL` until a human sets it. `frameworks/onboarding.py::produce_onboarding_profile` reads this as its default when no vertical is passed explicitly; a profile produced with no vertical (and not explicitly `allow_unqualified=True`) is refused. Distinct from `tenant_onboarding_profiles.vertical`, which is a point-in-time snapshot taken when a profile was produced — this column is the current, live-updatable value. |
+| `hub_domain` | `TEXT` | HubSpot's own domain for the portal, auto-captured from the OAuth access-token-info response on every install/reinstall. Readers should use `COALESCE(portal_name, hub_domain, hub_id)`, never `hub_domain` alone — this is the resolution order both the live session and `gateway/debug_api.py::list_tenants` use (`auth.TENANT_DISPLAY_NAME_SQL`). |
 | `install_status` | `TEXT` | `'installed'` (default, set on every successful `/callback`) or `'uninstalled'` (set by `auth/token_vault.py` when HubSpot's uninstall webhook fires). This is the flag that determines which tenants the scheduled sync (`sync/airtable_staging.py`) and the live session's default-open access (`session/live_session.py::_permitted_tenants`) both treat as "active" — an uninstalled tenant's row is kept, not deleted, but excluded from both. |
 | `installed_at` | `TIMESTAMPTZ` | Set once at first insert, never updated on re-install. |
-| `updated_at` | `TIMESTAMPTZ` | Bumped on every `install_status` or `vertical` change. |
+| `updated_at` | `TIMESTAMPTZ` | Bumped on every `install_status` change. |
+
+A `vertical` column existed here briefly (task 7.2) — removed 2026-09-08 alongside `tenant_onboarding_profiles`/`tenant_onboarding_profile_fields` below; see that section.
 
 Row lifecycle: created on `/callback` (`auth/hubspot_oauth.py::_persist_new_tenant`), `ON CONFLICT (hub_id) DO UPDATE` if the same portal re-installs. Never deleted by application code.
 
@@ -126,7 +127,7 @@ Populated as `company`/`deal` objects are staged by the scheduled sync job (`Sou
 
 ## `analysis_content`
 
-Blu Mountain's own-authored analysis content (`gateway/frameworks/`, see `openspec/changes/analysis-model-templates/`) — this project stores and serves this content verbatim, it never authors or edits it. Append-only by convention: `store.py::ingest()` always inserts a new row, never updates one in place, so a `tenant_onboarding_profile_fields.framework_guidance` value produced against an earlier version can never silently change out from under it.
+Blu Mountain's own-authored analysis content (`gateway/frameworks/`, see `openspec/changes/analysis-model-templates/`) — this project stores and serves this content verbatim, it never authors or edits it. Append-only by convention: `store.py::ingest()` always inserts a new row, never updates one in place, so anything that read a specific `(content_type, name, version)` in the past can never have that version's content silently change out from under it.
 
 | Column | Type | Notes |
 | :-- | :-- | :-- |
@@ -138,37 +139,11 @@ Blu Mountain's own-authored analysis content (`gateway/frameworks/`, see `opensp
 | `source_path` | `TEXT` (nullable) | Where the content was ingested from, if applicable. |
 | `ingested_at` | `TIMESTAMPTZ` | Set once at insert. |
 
-Unique on `(content_type, name, version)`; indexed on `(content_type, name, version DESC)` (`idx_analysis_content_lookup`) for `get_latest()`'s and `list_latest()`'s own query shape. Read by `frameworks/onboarding.py` (via `profiling.py`) when a profile auto-confirms a field against framework guidance, and by `frameworks/vertical.py`'s `KNOWN_VERTICALS` (derived from `ingest.py::FILE_MAP`, not this table directly) to validate a staff-set `tenants.vertical`.
+Unique on `(content_type, name, version)`; indexed on `(content_type, name, version DESC)` (`idx_analysis_content_lookup`) for `get_latest()`'s and `list_latest()`'s own query shape. Read by `frameworks/profiling.py::profile_tenant_fields` (and `gateway/scripts/generate_confirmed_fields.py`, which calls it) when cross-referencing a populated field against a vertical's `trust_by_default`/`unreliable_by_default` guidance, and by `frameworks/vertical.py`'s `KNOWN_VERTICALS` (derived from `ingest.py::FILE_MAP`, not this table directly) to enumerate which vertical names actually have stored framework content.
 
-## `tenant_onboarding_profiles`
+## `tenant_onboarding_profiles` / `tenant_onboarding_profile_fields` (removed)
 
-A lightweight, named, per-tenant snapshot of which HubSpot fields are confirmed relevant for that tenant's analysis (task 3, `specs/tenant-template-instantiation/spec.md`) — the runtime parameter meant to accompany a shared vertical framework at invocation time, **never** a copy of the framework/skill/prompt itself, which stay shared and unmodified in `analysis_content` above.
-
-| Column | Type | Notes |
-| :-- | :-- | :-- |
-| `id` | `SERIAL` (PK) | Referenced by `tenant_onboarding_profile_fields.profile_id`. |
-| `hub_id` | `TEXT` (`REFERENCES tenants(hub_id) ON DELETE CASCADE`) | Isolation is structural here, not just conventional: every read/write in `frameworks/onboarding.py` takes `hub_id` and enforces it directly in the query (a JOIN/WHERE clause) — a profile belonging to one tenant cannot be fetched or mutated through another tenant's `hub_id`, by construction, not just by caller discipline. |
-| `name` | `TEXT` | A snapshot of the tenant's effective display name (`COALESCE(portal_name, hub_domain, hub_id)`) **at production time**, not a live join — matches `analysis_content`'s versioned-snapshot philosophy, so it doesn't silently change if the tenant is later renamed. |
-| `vertical` | `TEXT` (nullable) | The vertical this specific profile was produced against — a point-in-time snapshot, distinct from the current, live-updatable `tenants.vertical`. `NULL` only if the profile was deliberately produced unqualified (`allow_unqualified=True`). |
-| `created_at` | `TIMESTAMPTZ` | Set once at insert; `get_latest_profile_for_tenant()` orders on this to find a tenant's most recent profile. Nothing purges old profiles. |
-
-Indexed on `hub_id` (`idx_tenant_onboarding_profiles_hub_id`). Produced by `frameworks/onboarding.py::produce_onboarding_profile()`, which reuses the existing, already-allowlisted `pull_crm_objects()` (no new HubSpot access path) via `frameworks/profiling.py`. Read by the vertical pull agent (task 8, `specs/vertical-pull-agent/spec.md`) via `get_latest_profile_for_tenant()`, to inject a client's confirmed-relevant fields into its per-tenant prompt.
-
-## `tenant_onboarding_profile_fields`
-
-One row per populated field a profile considered — only ever populated fields, since an unpopulated field has nothing to analyze regardless of framework guidance and is never a candidate.
-
-| Column | Type | Notes |
-| :-- | :-- | :-- |
-| `profile_id` | `INTEGER` (`REFERENCES tenant_onboarding_profiles(id) ON DELETE CASCADE`) | Part of composite PK. |
-| `object_type` | `TEXT` | HubSpot object type the field belongs to (e.g. `contacts`, `deals`). Part of composite PK. |
-| `property_name` | `TEXT` | Part of composite PK. |
-| `status` | `TEXT` | `confirmed_relevant` (auto-confirmed at production time if the tenant's vertical framework already had explicit guidance — `trust_by_default` or `unreliable_by_default`, either counts as the framework actively discussing the field), `confirmed_irrelevant`, or `needs_review` (no framework guidance existed at production time — a human must decide via `review_field()`). A profile is "final" (`OnboardingProfile.is_final`) only once no field is left at `needs_review`. |
-| `framework_guidance` | `TEXT` (nullable) | The framework's own guidance text for this field, carried over at auto-confirm time; `NULL` for a `needs_review` field. |
-| `reviewed_by` | `TEXT` (nullable) | Set by `review_field()` when a human moves a field off `needs_review`. |
-| `reviewed_at` | `TIMESTAMPTZ` (nullable) | Set alongside `reviewed_by`. |
-
-`review_field()` scopes its `UPDATE` through a JOIN back to `tenant_onboarding_profiles.hub_id`, the same structural isolation as the profile table itself — a review action can never target a profile belonging to a different tenant.
+Dropped 2026-09-08 (`DROP TABLE IF EXISTS`, applied idempotently on every startup, same as `mcp_tokens` above). Formerly a lightweight, named, per-tenant snapshot of which HubSpot fields were confirmed relevant for that tenant's analysis (task 3, `specs/tenant-template-instantiation/spec.md`), produced by `frameworks/onboarding.py::produce_onboarding_profile()` and reviewed via `review_field()`. Removed for the same reason as `vertical_agent_templates`/`client_agent_instances` below, and discovered the same way: a real-caller audit confirmed nothing in production still called any of `produce_onboarding_profile`/`get_profile_for_tenant`/`get_latest_profile_for_tenant`/`review_field` after the class-based agent migration — `CONFIRMED_FIELDS` (`gateway/frameworks/agents/clients/*.py`) replaced this persisted curation record with real, git-tracked code. `gateway/scripts/generate_confirmed_fields.py` now reads the same underlying live HubSpot data (`frameworks/profiling.py::profile_tenant_fields`) directly to propose `CONFIRMED_FIELDS` values, with no persistence layer in between — a decision printed once and either pasted into a client's file or discarded, not stored.
 
 ## Vertical/client agent configuration — not database tables anymore
 
@@ -182,5 +157,5 @@ Per-tenant refresh serialization (SC-4) uses `pg_advisory_xact_lock(hashtext(hub
 
 - **Every tenant-scoped table keys on `hub_id` as plain `TEXT`**, not a surrogate integer ID — this is deliberate: `hub_id` is externally meaningful (it's HubSpot's own identifier) and appears in every log line, audit entry, and API response as-is, so there's no separate internal-ID-to-`hub_id` mapping to keep in sync anywhere.
 - **Encryption at rest is scoped to exactly two columns**: `tokens.encrypted_access_token`/`encrypted_refresh_token` — the one vaulted credential, AES-256/HKDF, distinct per-tenant derived keys. Nothing else in this schema is encrypted at the column level — `staff_tenant_restrictions`, `audit_log`, etc. are plain text, which is fine since none of them hold a credential. (Formerly four columns, `mcp_tokens` included — dropped as part of the REST pivot, see that table's own note above.)
-- **Nothing in this schema is ever hard-deleted except via the two explicit purges** described above (`oauth_states` on successful callback, `audit_log` via the daily scheduled retention purge) and the `ON DELETE CASCADE` chains from `tenants` — to `tokens` directly, and to `tenant_onboarding_profiles` (which itself cascades to `tenant_onboarding_profile_fields`). Everything else (uninstalled tenants, old session selections, restriction rows, `analysis_content`) is left in place indefinitely by design or by current omission — see each table's notes above for which is which.
+- **Nothing in this schema is ever hard-deleted except via the two explicit purges** described above (`oauth_states` on successful callback, `audit_log` via the daily scheduled retention purge) and the `ON DELETE CASCADE` chain from `tenants` to `tokens`. Everything else (uninstalled tenants, old session selections, restriction rows, `analysis_content`) is left in place indefinitely by design or by current omission — see each table's notes above for which is which.
 - **This schema is applied against two separate real databases**: `mcp` (via `docker compose up`'s dev stack) and `mcp_test` (created automatically by `gateway/tests/conftest.py` on first test run). They share nothing — the test suite truncates every table it touches after each test, and running it against `mcp` directly destroyed a real, verified tenant install twice in one session before this separation was added.

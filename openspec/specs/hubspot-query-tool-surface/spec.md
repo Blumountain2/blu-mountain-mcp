@@ -14,8 +14,8 @@ The live session SHALL expose HubSpot CRM data through a small number of categor
 - **WHEN** the category-scoped tools replace the single generic tool
 - **THEN** every object type the generic tool could reach before is still reachable through exactly one of the new category tools
 
-### Requirement: A category tool can be scoped to a client's confirmed-relevant or custom fields
-Each category-scoped query tool SHALL accept an optional property-selection parameter, and SHALL be able to reference the calling client's own confirmed-relevant fields (from its onboarding profile) when deciding what's selectable. Under the REST-based pull path, an explicit property list SHALL narrow the response to exactly those properties, not additively alongside HubSpot's own default set — a real behavior change from the prior MCP-based mechanism, confirmed live during implementation rather than assumed to carry over unchanged.
+### Requirement: A category tool can be scoped to specific standard or custom fields
+Each category-scoped query tool SHALL accept an optional property-selection parameter, letting the caller (a connecting staff session, human or LLM) narrow a request to specific fields — including a portal's own custom properties, not just HubSpot's default set — without the tool needing any built-in notion of which fields are "confirmed relevant" for a given client; that judgment call is the caller's, not something this tool surface stores or looks up on its own. Under the REST-based pull path, an explicit property list SHALL narrow the response to exactly those properties, not additively alongside HubSpot's own default set — a real behavior change from the prior MCP-based mechanism, confirmed live during implementation rather than assumed to carry over unchanged.
 
 #### Scenario: A property-selection parameter narrows the returned fields
 - **WHEN** a category tool is called with an explicit property list

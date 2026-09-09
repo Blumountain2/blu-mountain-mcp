@@ -22,12 +22,13 @@ CREATE TABLE IF NOT EXISTS tenants (
 -- COALESCE(portal_name, hub_domain, hub_id), never hub_domain alone.
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS hub_domain TEXT;
 
--- A tenant's known vertical (task 7.2, openspec/changes/analysis-model-templates):
--- staff-set, never inferred automatically. Distinct from
--- tenant_onboarding_profiles.vertical, which is a point-in-time snapshot
--- taken when a profile was produced; this column is the current,
--- live-updatable value a new profile or pull-agent run reads at call time.
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS vertical TEXT;
+-- tenants.vertical (task 7.2, openspec/changes/analysis-model-templates)
+-- held a staff-set vertical for the profiling/onboarding pipeline below —
+-- dropped alongside it (see the note further down): a client's vertical
+-- is now fixed by which vertical class its agent subclasses
+-- (gateway/frameworks/agents/clients/*.py), a git-tracked decision, not a
+-- live-updatable database value.
+ALTER TABLE tenants DROP COLUMN IF EXISTS vertical;
 
 CREATE TABLE IF NOT EXISTS tokens (
     hub_id TEXT PRIMARY KEY REFERENCES tenants(hub_id) ON DELETE CASCADE,
@@ -158,50 +159,28 @@ CREATE TABLE IF NOT EXISTS analysis_content (
 CREATE INDEX IF NOT EXISTS idx_analysis_content_lookup
     ON analysis_content (content_type, name, version DESC);
 
--- A tenant onboarding profile (task 3, specs/tenant-template-instantiation
--- /spec.md): a lightweight, named, per-tenant record of which fields are
--- confirmed relevant for that tenant's analysis. Deliberately NOT a copy
--- of a framework/skill/prompt — those stay shared and unmodified in
--- analysis_content above; this is only the runtime parameter meant to
--- accompany one at invocation time. `name` is a snapshot of the tenant's
--- effective display name (portal_name -> hub_domain -> hub_id, same
--- resolution already used for the live session) AT PRODUCTION TIME, not
--- a live join — a profile is a point-in-time artifact, matching
--- analysis_content's own versioned-snapshot philosophy, so it doesn't
--- silently change if the tenant's name changes later. `vertical` may be
--- NULL if not yet known for this tenant.
-CREATE TABLE IF NOT EXISTS tenant_onboarding_profiles (
-    id SERIAL PRIMARY KEY,
-    hub_id TEXT NOT NULL REFERENCES tenants(hub_id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    vertical TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_tenant_onboarding_profiles_hub_id
-    ON tenant_onboarding_profiles (hub_id);
-
--- One row per populated field a profile considered. Only populated
--- fields are stored at all — an unpopulated field has nothing to analyze
--- regardless of framework guidance, so it's simply never a candidate.
--- status is 'confirmed_relevant' (auto-confirmed at production time if
--- the tenant's framework already has explicit guidance for this
--- property — either trust_by_default or unreliable_by_default, both are
--- the framework actively discussing this field, not silence about it),
--- 'confirmed_irrelevant', or 'needs_review' (no framework guidance
--- existed for this field at production time — a human must decide). A
--- profile is "final" only once no field is left at 'needs_review'
--- (frameworks.onboarding.OnboardingProfile.is_final).
-CREATE TABLE IF NOT EXISTS tenant_onboarding_profile_fields (
-    profile_id INTEGER NOT NULL REFERENCES tenant_onboarding_profiles(id) ON DELETE CASCADE,
-    object_type TEXT NOT NULL,
-    property_name TEXT NOT NULL,
-    status TEXT NOT NULL,
-    framework_guidance TEXT,
-    reviewed_by TEXT,
-    reviewed_at TIMESTAMPTZ,
-    PRIMARY KEY (profile_id, object_type, property_name)
-);
+-- tenant_onboarding_profiles/tenant_onboarding_profile_fields (task 3,
+-- specs/tenant-template-instantiation/spec.md): formerly a lightweight,
+-- named, per-tenant record of which fields were confirmed relevant for a
+-- tenant's analysis. Dropped for the same reason as vertical_agent_templates/
+-- client_agent_instances below, and discovered the same way: a real
+-- caller audit (2026-09-08) confirmed produce_onboarding_profile/
+-- get_profile_for_tenant/get_latest_profile_for_tenant/review_field had no
+-- production caller left after the class-based agent migration —
+-- CONFIRMED_FIELDS (gateway/frameworks/agents/clients/*.py) replaced this
+-- persisted, database-driven curation record with real, git-tracked code,
+-- the same "codebase, not Postgres rows" direction this whole area of the
+-- project has now taken twice. gateway/scripts/generate_confirmed_fields.py
+-- reads the same underlying live HubSpot data (frameworks.profiling.
+-- profile_tenant_fields) to propose CONFIRMED_FIELDS values directly,
+-- without a persistence layer in between. Dropped explicitly, applied
+-- idempotently on every startup like the tables below — neither real row's
+-- worth of data (hub_id 148997330, 149094230) had anything beyond
+-- needs_review fields, already re-derivable live from HubSpot at any time.
+-- tenant_onboarding_profile_fields dropped first since it FK-references
+-- tenant_onboarding_profiles.
+DROP TABLE IF EXISTS tenant_onboarding_profile_fields;
+DROP TABLE IF EXISTS tenant_onboarding_profiles;
 
 -- vertical_agent_templates/client_agent_instances (openspec/changes/
 -- separate-vertical-client-agents): persisted vertical/client agent

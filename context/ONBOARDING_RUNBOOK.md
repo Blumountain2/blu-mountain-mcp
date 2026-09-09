@@ -133,13 +133,14 @@ list:
 
 If a staff member ends up with access to more than one tenant (the normal
 case once more than one client is connected), they must call
-`select_tenant(hub_id)` once per session before any of the four
-category-scoped query tools (`query_crm_records`, `query_engagement_records`,
-`query_marketing_content`, `query_users` — replacing the single generic
-`query_hubspot_data` as of `openspec/changes/separate-vertical-client-agents`)
-return anything — this is enforced, not optional, regardless of whether that
-access came from being unrestricted (the default) or would have come from an
-explicit grant under the old model.
+`select_tenant(hub_id)` once per session before any of the six data tools
+(the four category-scoped ones — `query_crm_records`, `query_engagement_records`,
+`query_marketing_content`, `query_users`, replacing the single generic
+`query_hubspot_data` as of `openspec/changes/separate-vertical-client-agents`
+— plus `list_custom_objects`/`query_custom_object` for a portal's own custom
+object types, added 2026-09-08) return anything — this is enforced, not
+optional, regardless of whether that access came from being unrestricted
+(the default) or would have come from an explicit grant under the old model.
 
 **Auditing:** every tenant selection and every query is recorded in
 `audit_log` by `staff_identity` and `hub_id` — this is the only record tying

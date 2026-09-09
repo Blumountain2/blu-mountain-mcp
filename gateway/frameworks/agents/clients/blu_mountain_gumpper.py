@@ -13,19 +13,19 @@ from ..verticals.saas import SaaSAgent
 class BluMountainGumpperAgent(SaaSAgent):
     HUB_ID = "148997330"
 
-    # Nothing confirmed yet — every one of these was still needs_review
-    # in the prior tenant_onboarding_profile_fields rows (real state as
-    # of 2026-09-03, not invented). Move a name here, into the real
-    # object type's list, once a human actually decides it matters:
+    # Nothing confirmed yet, deliberately: setting any entry here narrows
+    # that object type's tool request to *only* the listed fields — it
+    # stops falling back to full discovery for that type (see
+    # context/CLIENT_AGENT_CLASSES.md). Leaving this empty means the
+    # agent currently sees every real field on every object type,
+    # including custom ones (health_score, plan_tier, jobtitle, etc.) —
+    # the safer default until a human deliberately trades that breadth
+    # for a narrower, curated set.
     #
-    # CONTACT: email, firstname, lastname, hs_full_name_or_email, hs_object_id
-    # COMPANY: domain, name, hs_object_id
-    # CALL: hs_call_title, hs_object_id
-    # EMAIL: hs_email_subject, hs_object_id
-    # MEETING_EVENT: hs_meeting_start_time, hs_meeting_start_time_iso,
-    #                hs_meeting_end_time, hs_meeting_end_time_iso,
-    #                hs_meeting_title, hs_object_id
-    # OBJECT_LIST: hs_list_name, hs_object_id
-    # TASK: hs_task_subject, hs_object_id
-    # USER: hs_email, hs_searchable_calculated_name, hs_object_id
+    # For a current, real candidate list (not a static snapshot that
+    # goes stale the moment a portal field changes): run
+    #   docker exec -w /app mcp-gateway python3 generate_confirmed_fields.py 148997330
+    # (see gateway/scripts/generate_confirmed_fields.py) — it separates
+    # populated fields into framework-trusted, framework-flagged-
+    # unreliable (excluded on purpose), and needs-a-human-decision.
     CONFIRMED_FIELDS: dict[str, list[str]] = {}

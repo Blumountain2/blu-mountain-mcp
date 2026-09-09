@@ -158,7 +158,7 @@ async def step2_custom_field_access_is_real():
 
 
 async def step3_category_tools_real_transport():
-    _banner("STEP 3 — Live session's category-scoped tools, real Client<->FastMCP, real HubSpot pulls")
+    _banner("STEP 3 — Live session's category-scoped + custom-object tools, real Client<->FastMCP, real HubSpot pulls")
     with patch.object(live_session, "get_access_token", _fake_staff_token):
         async with Client(live_session.mcp) as client:
             tools = await client.list_tools()
@@ -179,6 +179,35 @@ async def step3_category_tools_real_transport():
             has_engagement_data = "CALL" in engagement.data
             print(f"  query_engagement_records('calls') -> {len(engagement.data.get('CALL', []))} real record(s)")
 
+    # A fresh session (distinct jti) for PORTAL_B, since a stale
+    # live_session_selection row from the block above would otherwise
+    # still point at PORTAL_A for the same session_key.
+    with patch.object(live_session, "get_access_token", lambda: _fake_staff_token(jti="live-verification-custom-objects")):
+        async with Client(live_session.mcp) as client:
+            await client.call_tool("select_tenant", {"tenant": PORTAL_B})
+
+            schemas_result = await client.call_tool("list_custom_objects", {})
+            schemas = schemas_result.data
+            print(f"  list_custom_objects() -> {len(schemas)} real schema(s): {[s.get('name') for s in schemas]}")
+
+            has_custom_object_data = False
+            if schemas:
+                object_type_id = schemas[0]["objectTypeId"]
+                friendly_name = schemas[0].get("name")
+                custom_records = await client.call_tool("query_custom_object", {"object_type": object_type_id})
+                has_custom_object_data = bool(custom_records.data.get("records"))
+                print(
+                    f"  query_custom_object({object_type_id!r}) -> "
+                    f"{len(custom_records.data.get('records', []))} real record(s)"
+                )
+
+                # Also confirm the friendly-name resolution path specifically
+                # (2026-09-08) — not just the exact objectTypeId a caller
+                # already has from list_custom_objects.
+                by_name = await client.call_tool("query_custom_object", {"object_type": friendly_name})
+                resolves_by_name = by_name.data.get("object_type_id") == object_type_id
+                print(f"  query_custom_object({friendly_name!r}) resolves to {object_type_id!r}: {resolves_by_name}")
+
     expected_tools = {
         "list_my_tenants",
         "select_tenant",
@@ -186,13 +215,21 @@ async def step3_category_tools_real_transport():
         "query_engagement_records",
         "query_marketing_content",
         "query_users",
+        "list_custom_objects",
+        "query_custom_object",
     }
     if set(tool_names) != expected_tools:
         results.append(("3", "Category tools real transport", "FAIL", f"unexpected tool set: {tool_names}"))
-    elif has_crm_data and correctly_rejected and has_engagement_data:
-        results.append(("3", "Category tools real transport", "PASS", "real data returned per category, wrong-category request rejected"))
-    else:
+    elif not (has_crm_data and correctly_rejected and has_engagement_data):
         results.append(("3", "Category tools real transport", "FAIL", "one or more real-data/rejection checks failed"))
+    elif not schemas:
+        results.append(("3", "Category tools real transport", "FAIL", f"no custom object schemas found on {PORTAL_B} — expected the real Transaction object"))
+    elif not has_custom_object_data:
+        results.append(("3", "Category tools real transport", "FAIL", "list_custom_objects found a schema but query_custom_object returned no records"))
+    elif not resolves_by_name:
+        results.append(("3", "Category tools real transport", "FAIL", "query_custom_object's friendly-name resolution did not match the exact objectTypeId path"))
+    else:
+        results.append(("3", "Category tools real transport", "PASS", "real data returned per category, wrong-category request rejected, real custom-object schema+records reached by ID and by name"))
 
 
 async def step4_client_agent_run_real_anthropic():

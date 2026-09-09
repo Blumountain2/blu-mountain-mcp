@@ -60,8 +60,6 @@ _TABLES = [
     "live_session_selection",
     "hubspot_object_index",
     "analysis_content",
-    "tenant_onboarding_profile_fields",
-    "tenant_onboarding_profiles",
 ]
 
 

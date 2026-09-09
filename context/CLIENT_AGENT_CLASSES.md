@@ -43,7 +43,7 @@ Three things happen here:
 
 ## Create a new client's agent
 
-1. Confirm the tenant is actually installed (`tenants` table, `install_status = 'installed'`) and knows its real vertical (a human decision — check with whoever onboarded the client, or `frameworks.vertical.get_tenant_vertical(hub_id)` if it's already set correctly; don't assume from the tenant's name or industry guess).
+1. Confirm the tenant is actually installed (`tenants` table, `install_status = 'installed'`) and know its real vertical — a human decision, check with whoever onboarded the client; don't assume from the tenant's name or industry guess. There's no database column to check instead (see `VERTICAL_AGENT_CLASSES.md`) — a client's vertical is only ever known by which vertical class its agent subclasses, so for an existing client, read its own file.
 2. Create `gateway/frameworks/agents/clients/<client_slug>.py`:
    ```python
    from ..registry import register_client_agent

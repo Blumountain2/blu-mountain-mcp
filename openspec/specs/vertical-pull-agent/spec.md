@@ -22,11 +22,11 @@ The pull agent SHALL call only tools that wrap already-allowlisted, already-test
 - **THEN** the call is refused before it reaches HubSpot, the same way it already is for every non-agent caller of these methods
 
 ### Requirement: Context assembly for one tenant reads only that tenant's own data
-Building a pull-agent request for a tenant SHALL source every piece of injected context — onboarding profile, goals, HubSpot connection — exclusively from that tenant's own records.
+Building a pull-agent request for a tenant SHALL source every piece of injected context — its own client class's `CONFIRMED_FIELDS`, its vertical's framework text, and its HubSpot connection — exclusively from that tenant's own records.
 
 #### Scenario: Building tenant A's request never reads tenant B's data
 - **WHEN** a pull-agent request is assembled for tenant A
-- **THEN** no onboarding profile, goal, or HubSpot record belonging to any other tenant is read or included
+- **THEN** no `CONFIRMED_FIELDS` value or HubSpot record belonging to any other tenant is read or included
 
 ### Requirement: A single pull-agent call never contains more than one tenant's data
 An assembled pull-agent request SHALL contain exactly one tenant's data, even when a scheduled process is handling multiple tenants in the same run.

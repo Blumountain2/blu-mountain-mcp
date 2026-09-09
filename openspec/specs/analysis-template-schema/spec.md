@@ -36,9 +36,9 @@ In addition to the six vertical frameworks, the operational skill, and the runti
 - **THEN** it is retrievable on its own, not only as a byproduct of loading a specific vertical framework
 
 ### Requirement: Framework content versions independently of any tenant-specific record
-Updating a stored framework, skill, or prompt to a new version SHALL NOT modify or invalidate any tenant-specific onboarding profile already produced against an earlier version.
+Updating a stored framework, skill, or prompt to a new version SHALL NOT modify or invalidate any tenant-specific artifact already produced against an earlier version (e.g. a client's own `CONFIRMED_FIELDS`, git-committed against a framework version at the time it was curated).
 
-#### Scenario: A framework update does not affect an already-produced tenant profile
+#### Scenario: A framework update does not affect an already-curated client field list
 - **WHEN** the stored "SaaS" framework is updated to a new version
-- **THEN** a tenant's onboarding profile already produced against the prior version continues to read as it did before the update
+- **THEN** a client's `CONFIRMED_FIELDS`, already curated against the prior version, continues to read as it did before the update — updating the framework never rewrites or invalidates it
 

@@ -259,6 +259,47 @@ async def test_profile_tenant_fields_marks_custom_fields_using_hubspot_defined_f
     assert by_name["gumpper_lead_score"].is_custom is True
 
 
+# --- custom objects (2026-09-08): profiled the same way as a standard
+# object type, just keyed by objectTypeId and reached via the
+# discover_custom_object_properties/pull_custom_object pair ---
+
+
+@pytest.mark.asyncio
+async def test_profile_tenant_fields_also_profiles_custom_object_type_ids(monkeypatch):
+    _patch_client(monkeypatch, [{"properties": {"amount": "100"}}])
+
+    result = await profile_tenant_fields(
+        "hub_a", object_types=["COMPANY"], custom_object_type_ids=["2-123456"]
+    )
+
+    assert "COMPANY" in result
+    assert "2-123456" in result
+    assert result["2-123456"][0].name == "amount"
+
+
+@pytest.mark.asyncio
+async def test_profile_tenant_fields_marks_custom_object_fields_using_hubspot_defined_flag(monkeypatch):
+    _patch_client(
+        monkeypatch,
+        [{"properties": {"transaction_status": "closed"}}],
+        property_definitions=[{"name": "transaction_status", "hubspotDefined": False}],
+    )
+
+    result = await profile_tenant_fields("hub_a", object_types=[], custom_object_type_ids=["2-123456"])
+
+    by_name = {p.name: p for p in result["2-123456"]}
+    assert by_name["transaction_status"].is_custom is True
+
+
+@pytest.mark.asyncio
+async def test_profile_tenant_fields_omitting_custom_object_type_ids_only_profiles_standard_types(monkeypatch):
+    _patch_client(monkeypatch, [{"properties": {"name": "Acme"}}])
+
+    result = await profile_tenant_fields("hub_a", object_types=["COMPANY"])
+
+    assert set(result.keys()) == {"COMPANY"}
+
+
 @pytest.mark.asyncio
 async def test_a_discovery_failure_for_one_object_type_does_not_fail_the_whole_run(monkeypatch):
     async def fake_discover(self, object_type, client=None, headers=None):
