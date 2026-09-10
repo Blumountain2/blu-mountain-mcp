@@ -75,12 +75,29 @@ OBJECT_TABLES = {
 
 SYBILL_TABLE = "SybillTranscripts"
 
+# openspec/changes/vertical-diagnostic-agent: one diagnostic-phase report
+# per row, tagged by client — its own table rather than reusing
+# OBJECT_TABLES/_STAGING_FIELDS, since a report's shape (summary/KPIs/risk
+# flags) is structurally unrelated to a raw HubSpot object payload.
+DIAGNOSTIC_REPORTS_TABLE = "DiagnosticReports"
+
 _STAGING_FIELDS = [
     {"name": "Client", "type": "singleLineText"},
     {"name": "Source ID", "type": "singleLineText"},
     {"name": "Object Type", "type": "singleLineText"},
     {"name": "Data", "type": "multilineText"},
     {"name": "Synced At", "type": "dateTime", "options": {
+        "dateFormat": {"name": "iso"}, "timeFormat": {"name": "24hour"}, "timeZone": "utc"
+    }},
+]
+
+_DIAGNOSTIC_REPORT_FIELDS = [
+    {"name": "Client", "type": "singleLineText"},
+    {"name": "Vertical", "type": "singleLineText"},
+    {"name": "Summary", "type": "multilineText"},
+    {"name": "KPIs", "type": "multilineText"},
+    {"name": "Risk Flags", "type": "multilineText"},
+    {"name": "Generated At", "type": "dateTime", "options": {
         "dateFormat": {"name": "iso"}, "timeFormat": {"name": "24hour"}, "timeZone": "utc"
     }},
 ]
@@ -109,6 +126,10 @@ def ensure_schema() -> None:
             continue
         base.create_table(name=table_name, fields=_STAGING_FIELDS)
         logger.info("airtable_staging.table_created", table=table_name)
+
+    if DIAGNOSTIC_REPORTS_TABLE not in existing:
+        base.create_table(name=DIAGNOSTIC_REPORTS_TABLE, fields=_DIAGNOSTIC_REPORT_FIELDS)
+        logger.info("airtable_staging.table_created", table=DIAGNOSTIC_REPORTS_TABLE)
 
 
 def normalize_record(hub_id: str, object_type: str, raw: dict) -> dict:
@@ -148,6 +169,37 @@ def normalize_sybill_transcript(hub_id: str, payload: dict) -> dict:
         "Data": json.dumps(payload, default=str),
         "Synced At": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def normalize_diagnostic_report(hub_id: str, vertical: str, report: dict) -> dict:
+    """Normalizes one diagnostic-phase report (openspec/changes/vertical-
+    diagnostic-agent) into a staging row, tagged by client. KPIs and risk
+    flags are stored as JSON text — like every other staged payload's Data
+    column — rather than modeled as Airtable's own array/multi-select
+    field types, so a framework's KPI shape can vary without a schema
+    migration."""
+    return {
+        "Client": hub_id,
+        "Vertical": vertical,
+        "Summary": report.get("summary", ""),
+        "KPIs": json.dumps(report.get("kpis", []), default=str),
+        "Risk Flags": json.dumps(report.get("risk_flags", []), default=str),
+        "Generated At": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def stage_diagnostic_report(hub_id: str, vertical: str, report: dict) -> None:
+    """Stages one diagnostic-phase report into Airtable, tagged by client —
+    the same per-tenant, tagged-by-client convention as stage_tenant_pull.
+    Raises on failure rather than swallowing it: the caller (the
+    live-session diagnostic tool) is responsible for logging/auditing a
+    staging failure distinctly from a successful stage, per this
+    capability's own spec requirement."""
+    api = _api()
+    base = api.base(settings.airtable_base_id)
+    table = base.table(DIAGNOSTIC_REPORTS_TABLE)
+    table.create(normalize_diagnostic_report(hub_id, vertical, report))
+    logger.info("airtable_staging.diagnostic_report_staged", hub_id=hub_id, vertical=vertical)
 
 
 async def stage_tenant_pull(hub_id: str, pulled: dict[str, object]) -> None:

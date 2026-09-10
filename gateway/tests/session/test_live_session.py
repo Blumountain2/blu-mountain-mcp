@@ -14,6 +14,9 @@ import pytest
 from fastmcp import Client
 
 from db import get_pool
+from frameworks.agents import registry
+from frameworks.agents.base import BaseAgent
+from frameworks.agents.registry import register_client_agent
 from session import live_session
 from sync.hubspot_client import HubSpotDataPullClient
 
@@ -256,6 +259,38 @@ async def test_list_my_tenants_treats_blank_portal_name_as_missing(monkeypatch):
 
     by_id = {t["hub_id"]: t["name"] for t in tenants}
     assert by_id["hub_blank_name"] == "blumountain.me"
+
+
+@pytest.mark.asyncio
+async def test_list_my_tenants_includes_vertical_for_a_registered_tenant(monkeypatch):
+    await _seed_named_tenant("hub_named_vertical", monkeypatch, portal_name="Vertical Co")
+    before = set(registry._REGISTRY.keys())
+
+    @register_client_agent("hub_named_vertical")
+    class _TestAgent(BaseAgent):
+        VERTICAL = "marketplace"
+        HUB_ID = "hub_named_vertical"
+
+    try:
+        tenants = await live_session.list_my_tenants()
+    finally:
+        for hub_id in set(registry._REGISTRY.keys()) - before:
+            del registry._REGISTRY[hub_id]
+
+    by_id = {t["hub_id"]: t["vertical"] for t in tenants}
+    assert by_id["hub_named_vertical"] == "marketplace"
+
+
+@pytest.mark.asyncio
+async def test_list_my_tenants_vertical_is_none_for_an_unregistered_tenant(monkeypatch):
+    # A tenant can be installed and permitted for a staff session with no
+    # agent class authored for it yet — this must not break the listing.
+    await _seed_named_tenant("hub_named_no_agent", monkeypatch, portal_name="No Agent Co")
+
+    tenants = await live_session.list_my_tenants()
+
+    by_id = {t["hub_id"]: t["vertical"] for t in tenants}
+    assert by_id["hub_named_no_agent"] is None
 
 
 @pytest.mark.asyncio
@@ -775,6 +810,121 @@ async def test_query_custom_object_never_constructs_a_client_for_a_restricted_te
     assert "hub_custom_pull_leak_restricted" not in constructed_hub_ids
 
 
+# --- run_vertical_diagnostic (openspec/changes/vertical-diagnostic-agent) ---
+# The gather/diagnose phases themselves are covered independently in
+# tests/frameworks/agents/ — these tests prove the live-session tool's own
+# wiring (tenant resolution, staging, staged: bool reporting, clear
+# failure for an unregistered tenant), using a throwaway registered agent
+# class whose run()/diagnose() are overridden directly rather than
+# exercising real HubSpot/Anthropic calls.
+
+
+def _clean_registry_after(before: set[str]):
+    for hub_id in set(registry._REGISTRY.keys()) - before:
+        del registry._REGISTRY[hub_id]
+
+
+@pytest.mark.asyncio
+async def test_run_vertical_diagnostic_returns_report_and_stages_it(monkeypatch):
+    await _seed_named_tenant("hub_diag_a", monkeypatch, portal_name="Diag Co")
+    before = set(registry._REGISTRY.keys())
+
+    @register_client_agent("hub_diag_a")
+    class _TestAgent(BaseAgent):
+        VERTICAL = "saas"
+        HUB_ID = "hub_diag_a"
+        FRAMEWORK_TEXT = "test framework text"
+
+        async def run(self):
+            return {"CONTACT": [{"properties": {}}]}
+
+        async def diagnose(self, gathered):
+            return {"summary": "ok", "kpis": [], "risk_flags": []}
+
+    staged_calls = []
+
+    async def fake_stage(hub_id, vertical, report):
+        staged_calls.append((hub_id, vertical, report))
+
+    monkeypatch.setattr(live_session, "stage_diagnostic_report", fake_stage)
+
+    try:
+        result = await live_session.run_vertical_diagnostic()
+    finally:
+        _clean_registry_after(before)
+
+    assert result == {"summary": "ok", "kpis": [], "risk_flags": [], "staged": True}
+    assert staged_calls == [("hub_diag_a", "saas", {"summary": "ok", "kpis": [], "risk_flags": []})]
+
+
+@pytest.mark.asyncio
+async def test_run_vertical_diagnostic_passes_only_this_runs_gather_output_into_diagnose(monkeypatch):
+    await _seed_named_tenant("hub_diag_b", monkeypatch, portal_name="Diag Co B")
+    before = set(registry._REGISTRY.keys())
+    captured = {}
+
+    @register_client_agent("hub_diag_b")
+    class _TestAgent(BaseAgent):
+        VERTICAL = "saas"
+        HUB_ID = "hub_diag_b"
+        FRAMEWORK_TEXT = "test framework text"
+
+        async def run(self):
+            return {"CONTACT": [{"properties": {"tag": "hub_diag_b"}}]}
+
+        async def diagnose(self, gathered):
+            captured["gathered"] = gathered
+            return {"summary": "ok", "kpis": [], "risk_flags": []}
+
+    monkeypatch.setattr(live_session, "stage_diagnostic_report", AsyncMock())
+
+    try:
+        await live_session.run_vertical_diagnostic()
+    finally:
+        _clean_registry_after(before)
+
+    assert captured["gathered"] == {"CONTACT": [{"properties": {"tag": "hub_diag_b"}}]}
+
+
+@pytest.mark.asyncio
+async def test_run_vertical_diagnostic_reports_staged_false_on_staging_failure(monkeypatch):
+    await _seed_named_tenant("hub_diag_c", monkeypatch, portal_name="Diag Co C")
+    before = set(registry._REGISTRY.keys())
+
+    @register_client_agent("hub_diag_c")
+    class _TestAgent(BaseAgent):
+        VERTICAL = "saas"
+        HUB_ID = "hub_diag_c"
+        FRAMEWORK_TEXT = "test framework text"
+
+        async def run(self):
+            return {}
+
+        async def diagnose(self, gathered):
+            return {"summary": "ok", "kpis": [], "risk_flags": []}
+
+    async def failing_stage(hub_id, vertical, report):
+        raise RuntimeError("airtable down")
+
+    monkeypatch.setattr(live_session, "stage_diagnostic_report", failing_stage)
+
+    try:
+        result = await live_session.run_vertical_diagnostic()
+    finally:
+        _clean_registry_after(before)
+
+    assert result["staged"] is False
+    assert result["summary"] == "ok"  # staging failure doesn't discard the already-generated report
+
+
+@pytest.mark.asyncio
+async def test_run_vertical_diagnostic_fails_clearly_for_an_unregistered_tenant(monkeypatch):
+    await _seed_named_tenant("hub_diag_unregistered", monkeypatch, portal_name="No Agent Co")
+
+    with pytest.raises(ValueError, match="hub_diag_unregistered"):
+        await live_session.run_vertical_diagnostic()
+
+
 # Every test above calls live_session's plain async functions directly —
 # real, but it never exercises the actual MCP transport layer itself: tool
 # discovery, JSON-RPC parameter binding, or result (de)serialization. A
@@ -815,6 +965,7 @@ async def test_real_transport_lists_all_eight_tools_with_correct_schemas(monkeyp
         "query_users": {"object_type", "properties"},
         "list_custom_objects": set(),
         "query_custom_object": {"object_type", "properties"},
+        "run_vertical_diagnostic": set(),
     }
 
 
@@ -829,7 +980,9 @@ async def test_real_transport_list_my_tenants_and_select_tenant_round_trip(monke
         list_result = await client.call_tool("list_my_tenants", {})
         select_result = await client.call_tool("select_tenant", {"tenant": "Real Transport Test"})
 
-    assert list_result.data == [{"hub_id": "hub_transport_a", "name": "Real Transport Test"}]
+    assert list_result.data == [
+        {"hub_id": "hub_transport_a", "name": "Real Transport Test", "vertical": None}
+    ]
     assert select_result.data == {"selected_hub_id": "hub_transport_a", "name": "Real Transport Test"}
 
 
@@ -915,6 +1068,43 @@ async def test_real_transport_query_custom_object_round_trip(monkeypatch):
         )
 
     assert result.data == {"object_type_id": "2-3465404", "records": [{"id": "txn-1", "properties": {}}]}
+
+
+@pytest.mark.asyncio
+async def test_real_transport_run_vertical_diagnostic_round_trip(monkeypatch):
+    """A real call_tool round trip for the diagnostic tool — real JSON-RPC
+    request and result (de)serialization for a tool with no parameters at
+    all, which a direct Python call could accidentally get right even with
+    a broken FastMCP registration."""
+    await _seed_single_tenant("hub_transport_diag", monkeypatch)
+    before = set(registry._REGISTRY.keys())
+
+    @register_client_agent("hub_transport_diag")
+    class _TestAgent(BaseAgent):
+        VERTICAL = "saas"
+        HUB_ID = "hub_transport_diag"
+        FRAMEWORK_TEXT = "test framework text"
+
+        async def run(self):
+            return {"CONTACT": []}
+
+        async def diagnose(self, gathered):
+            return {"summary": "Real transport test report.", "kpis": [], "risk_flags": []}
+
+    monkeypatch.setattr(live_session, "stage_diagnostic_report", AsyncMock())
+
+    try:
+        async with Client(live_session.mcp) as client:
+            result = await client.call_tool("run_vertical_diagnostic", {})
+    finally:
+        _clean_registry_after(before)
+
+    assert result.data == {
+        "summary": "Real transport test report.",
+        "kpis": [],
+        "risk_flags": [],
+        "staged": True,
+    }
 
 
 @pytest.mark.asyncio

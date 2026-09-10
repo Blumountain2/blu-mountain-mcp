@@ -8,7 +8,13 @@ import pytest
 
 from db import get_pool
 from sync import airtable_staging
-from sync.airtable_staging import normalize_record, run_staging_cycle, stage_tenant_pull
+from sync.airtable_staging import (
+    normalize_diagnostic_report,
+    normalize_record,
+    run_staging_cycle,
+    stage_diagnostic_report,
+    stage_tenant_pull,
+)
 
 
 class _FakeTableSchema:
@@ -28,6 +34,9 @@ class _FakeTable:
 
     def batch_create(self, rows):
         self._store.setdefault(self._name, []).extend(rows)
+
+    def create(self, row):
+        self._store.setdefault(self._name, []).append(row)
 
 
 class _FakeBase:
@@ -102,6 +111,47 @@ def test_ensure_schema_creates_only_missing_tables(fake_base):
     assert "Contacts" not in fake_base.tables_created
     assert "Deals" in fake_base.tables_created
     assert "SybillTranscripts" in fake_base.tables_created
+    assert "DiagnosticReports" in fake_base.tables_created
+
+
+def test_ensure_schema_skips_diagnostic_reports_table_if_already_present(fake_base):
+    fake_base._existing.add("DiagnosticReports")
+    airtable_staging.ensure_schema()
+
+    assert "DiagnosticReports" not in fake_base.tables_created
+
+
+def test_normalize_diagnostic_report_tags_by_client_and_vertical():
+    report = {"summary": "Healthy.", "kpis": [{"name": "MRR", "value": "$1,000"}], "risk_flags": ["none"]}
+    row = normalize_diagnostic_report("hub_a", "saas", report)
+
+    assert row["Client"] == "hub_a"
+    assert row["Vertical"] == "saas"
+    assert row["Summary"] == "Healthy."
+    assert "MRR" in row["KPIs"]
+    assert "none" in row["Risk Flags"]
+
+
+@pytest.mark.asyncio
+async def test_stage_diagnostic_report_writes_one_row_to_the_diagnostic_reports_table(fake_base):
+    report = {"summary": "Healthy.", "kpis": [], "risk_flags": []}
+    await stage_diagnostic_report("hub_a", "saas", report)
+
+    rows = fake_base.written["DiagnosticReports"]
+    assert len(rows) == 1
+    assert rows[0]["Client"] == "hub_a"
+    assert rows[0]["Vertical"] == "saas"
+
+
+@pytest.mark.asyncio
+async def test_stage_diagnostic_report_isolation_across_tenants(fake_base):
+    await stage_diagnostic_report("hub_a", "saas", {"summary": "a", "kpis": [], "risk_flags": []})
+    await stage_diagnostic_report("hub_b", "marketplace", {"summary": "b", "kpis": [], "risk_flags": []})
+
+    rows = fake_base.written["DiagnosticReports"]
+    by_client = {r["Client"]: r for r in rows}
+    assert by_client["hub_a"]["Summary"] == "a"
+    assert by_client["hub_b"]["Summary"] == "b"
 
 
 @pytest.mark.asyncio

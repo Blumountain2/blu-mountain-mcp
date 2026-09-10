@@ -20,8 +20,8 @@ stack):
     docker cp gateway/scripts/live_verification.py mcp-gateway:/app/live_verification.py
     docker exec -w /app mcp-gateway python3 live_verification.py
 
-Six independent steps — one failing or not-ready doesn't stop the others.
-A summary table at the end shows PASS/FAIL/SKIP/NOT READY for all six.
+Seven independent steps — one failing or not-ready doesn't stop the others.
+A summary table at the end shows PASS/FAIL/SKIP/NOT READY for all seven.
 """
 
 import asyncio
@@ -33,6 +33,7 @@ from fastmcp import Client
 from db import get_pool
 from frameworks.agents import clients as _client_agents  # noqa: F401 — registers real clients
 from frameworks.agents.registry import get_registered_agent_class, registered_hub_ids
+from frameworks.agents.tools import bind_tool_executor
 from frameworks.agents.verticals.ecommerce import EcommerceAgent
 from frameworks.agents.verticals.marketplace import MarketplaceAgent
 from frameworks.agents.verticals.plg import PLGAgent
@@ -217,6 +218,7 @@ async def step3_category_tools_real_transport():
         "query_users",
         "list_custom_objects",
         "query_custom_object",
+        "run_vertical_diagnostic",
     }
     if set(tool_names) != expected_tools:
         results.append(("3", "Category tools real transport", "FAIL", f"unexpected tool set: {tool_names}"))
@@ -270,7 +272,11 @@ async def step6_custom_object_reachable_through_the_agents_own_tool_loop():
     try:
         agent = get_registered_agent_class(PORTAL_B)()
         gathered: dict[str, list] = {}
-        execute_tool = agent._bind_tool_executor(None, None, gathered, max_tool_calls=5)
+        # bind_tool_executor moved to frameworks.agents.tools
+        # (openspec/changes/vertical-diagnostic-agent's tools.py split) —
+        # it's a standalone function now, not a BaseAgent method, taking
+        # the agent's own hs_client/_confirmed_fields_for explicitly.
+        execute_tool = bind_tool_executor(agent.hs_client, agent._confirmed_fields_for, None, None, gathered, 5)
 
         schemas_json = await execute_tool("list_custom_objects", {})
         print(f"  list_custom_objects -> {schemas_json}")
@@ -294,6 +300,37 @@ async def step6_custom_object_reachable_through_the_agents_own_tool_loop():
             results.append(("6", "Custom object via agent loop", "FAIL", f"pull did not return a record list: {pull_result_json}"))
     except Exception as exc:
         results.append(("6", "Custom object via agent loop", "NOT READY", str(exc)[:90]))
+
+
+async def step7_run_vertical_diagnostic_real():
+    _banner("STEP 7 (optional) — run_vertical_diagnostic against a real portal, real Anthropic, real Airtable staging")
+    from config import settings
+
+    if not settings.anthropic_api_key:
+        results.append(("7", "Real diagnostic report", "NOT READY", "no ANTHROPIC_API_KEY configured"))
+        return
+
+    try:
+        with patch.object(live_session, "get_access_token", lambda: _fake_staff_token(jti="live-verification-diagnostic")):
+            async with Client(live_session.mcp) as client:
+                await client.call_tool("select_tenant", {"tenant": PORTAL_A})
+                result = await client.call_tool("run_vertical_diagnostic", {})
+
+        report = result.data
+        print(f"  summary: {report.get('summary', '')[:200]}")
+        print(f"  kpis: {report.get('kpis')}")
+        print(f"  risk_flags: {report.get('risk_flags')}")
+        print(f"  staged: {report.get('staged')}")
+
+        is_narrative = bool(report.get("summary")) and "properties" not in report
+        if not is_narrative:
+            results.append(("7", "Real diagnostic report", "FAIL", "response did not look like a real narrative report"))
+        elif not report.get("staged"):
+            results.append(("7", "Real diagnostic report", "NOT READY", "report generated but Airtable staging failed or is not configured"))
+        else:
+            results.append(("7", "Real diagnostic report", "PASS", f"real narrative report generated and staged for {PORTAL_A}"))
+    except Exception as exc:
+        results.append(("7", "Real diagnostic report", "NOT READY", str(exc)[:90]))
 
 
 async def step5_two_real_portals_return_distinct_data():
@@ -342,6 +379,7 @@ async def main():
     await step4_client_agent_run_real_anthropic()
     await step5_two_real_portals_return_distinct_data()
     await step6_custom_object_reachable_through_the_agents_own_tool_loop()
+    await step7_run_vertical_diagnostic_real()
 
     _banner("SUMMARY")
     for step, label, status, note in results:

@@ -14,19 +14,16 @@ import asyncio
 import pytest
 
 from db import get_pool
-from frameworks.agents import base
+from frameworks.agents import base, diagnostics
 from frameworks.agents.base import MAX_TOOL_CALLS, BaseAgent
-from frameworks.store import CONTENT_TYPE_FRAMEWORK, ingest
 from sync.hubspot_client import HubSpotDataPullClient
+
+DEFAULT_TEST_FRAMEWORK_TEXT = "Trust hs_object_id. Pull CONTACT and COMPANY."
 
 
 async def _seed_tenant(hub_id: str) -> None:
     pool = await get_pool()
     await pool.execute("INSERT INTO tenants (hub_id, install_status) VALUES ($1, 'installed')", hub_id)
-
-
-async def _seed_framework(vertical: str = "saas", content: str = "Trust hs_object_id. Pull CONTACT and COMPANY.") -> None:
-    await ingest(CONTENT_TYPE_FRAMEWORK, vertical, content)
 
 
 def _agent_class(
@@ -35,12 +32,17 @@ def _agent_class(
     confirmed_fields: dict | None = None,
     additions: str = "",
     max_tool_calls: int | None = None,
+    framework_text: str = DEFAULT_TEST_FRAMEWORK_TEXT,
 ):
     """Builds a throwaway BaseAgent subclass for one test — the class-based
-    equivalent of what _seed_client's DB fixtures used to construct."""
+    equivalent of what _seed_client's DB fixtures used to construct.
+    FRAMEWORK_TEXT is now a plain class attribute (openspec/changes/
+    vertical-framework-content-in-code), not read from analysis_content,
+    so tests set it directly rather than seeding the database."""
     attrs = {
         "VERTICAL": vertical,
         "HUB_ID": hub_id,
+        "FRAMEWORK_TEXT": framework_text,
         "CONFIRMED_FIELDS": confirmed_fields or {},
         "SYSTEM_PROMPT_ADDITIONS": additions,
     }
@@ -51,7 +53,6 @@ def _agent_class(
 
 async def _seed_client(hub_id: str, vertical: str = "saas", **kwargs):
     await _seed_tenant(hub_id)
-    await _seed_framework(vertical)
     return _agent_class(hub_id, vertical=vertical, **kwargs)
 
 
@@ -448,15 +449,14 @@ async def test_a_client_class_can_override_the_default_budget(monkeypatch):
     assert result == {}
 
 
-# --- an unstored vertical raises clearly rather than silently pulling nothing ---
+# --- a client class with no framework text refuses to construct ---
 
 
-@pytest.mark.asyncio
-async def test_running_raises_clearly_when_no_framework_is_stored_for_the_vertical():
-    agent_class = _agent_class("hub_a", vertical="a-vertical-with-no-stored-framework")
+def test_a_client_class_with_no_framework_text_refuses_to_construct():
+    agent_class = _agent_class("hub_a", vertical="a-vertical-with-no-framework-text", framework_text="")
 
-    with pytest.raises(ValueError, match="No stored framework"):
-        await agent_class().run()
+    with pytest.raises(ValueError, match="FRAMEWORK_TEXT"):
+        agent_class()
 
 
 # --- custom object reach ---
@@ -545,3 +545,95 @@ async def test_a_portal_without_custom_object_access_degrades_gracefully(monkeyp
     result = await agent_class().run()
 
     assert result == {}
+
+
+# --- the diagnostic phase (openspec/changes/vertical-diagnostic-agent) ---
+
+
+@pytest.mark.asyncio
+async def test_diagnose_returns_a_narrative_not_the_raw_records_shape(monkeypatch):
+    agent_class = await _seed_client("hub_a")
+    report = {"summary": "All healthy.", "kpis": [], "risk_flags": []}
+
+    async def fake_produce_diagnostic_report(**kwargs):
+        return report
+
+    monkeypatch.setattr(diagnostics, "produce_diagnostic_report", fake_produce_diagnostic_report)
+
+    result = await agent_class().diagnose({"CONTACT": [{"properties": {}}]})
+
+    assert result == report
+    assert "CONTACT" not in result
+
+
+@pytest.mark.asyncio
+async def test_diagnose_passes_only_this_runs_own_gathered_data_through(monkeypatch):
+    agent_class = await _seed_client("hub_a")
+    captured = {}
+
+    async def fake_produce_diagnostic_report(vertical, framework_text, client_name, system_prompt_additions, gathered):
+        captured["gathered"] = gathered
+        captured["vertical"] = vertical
+        captured["framework_text"] = framework_text
+        captured["client_name"] = client_name
+        return {"summary": "ok", "kpis": [], "risk_flags": []}
+
+    monkeypatch.setattr(diagnostics, "produce_diagnostic_report", fake_produce_diagnostic_report)
+    tenant_a_gathered = {"CONTACT": [{"properties": {"hub_id_tag": "hub_a"}}]}
+
+    await agent_class().diagnose(tenant_a_gathered)
+
+    assert captured["gathered"] is tenant_a_gathered
+    assert captured["vertical"] == "saas"
+    assert captured["framework_text"] == DEFAULT_TEST_FRAMEWORK_TEXT
+    assert captured["client_name"] == "hub_a"  # falls back to HUB_ID when CLIENT_NAME unset
+
+
+@pytest.mark.asyncio
+async def test_diagnose_has_no_hubspot_client_of_its_own(monkeypatch):
+    agent_class = await _seed_client("hub_a")
+
+    async def fake_produce_diagnostic_report(**kwargs):
+        return {"summary": "ok", "kpis": [], "risk_flags": []}
+
+    monkeypatch.setattr(diagnostics, "produce_diagnostic_report", fake_produce_diagnostic_report)
+    assert not hasattr(diagnostics, "HubSpotDataPullClient")
+
+    await agent_class().diagnose({})
+
+
+@pytest.mark.asyncio
+async def test_successful_diagnostic_run_is_audited_under_the_correct_hub_id(monkeypatch):
+    agent_class = await _seed_client("hub_a")
+
+    async def fake_produce_diagnostic_report(**kwargs):
+        return {"summary": "ok", "kpis": [], "risk_flags": []}
+
+    monkeypatch.setattr(diagnostics, "produce_diagnostic_report", fake_produce_diagnostic_report)
+
+    await agent_class().diagnose({})
+
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT hub_id, event_type FROM audit_log WHERE event_type = 'diagnostic_run_completed'"
+    )
+    assert row["hub_id"] == "hub_a"
+
+
+@pytest.mark.asyncio
+async def test_failed_diagnostic_run_is_audited_under_the_correct_hub_id_and_reraises(monkeypatch):
+    agent_class = await _seed_client("hub_a")
+
+    async def failing_produce_diagnostic_report(**kwargs):
+        raise RuntimeError("diagnostic boom")
+
+    monkeypatch.setattr(diagnostics, "produce_diagnostic_report", failing_produce_diagnostic_report)
+
+    with pytest.raises(RuntimeError, match="diagnostic boom"):
+        await agent_class().diagnose({})
+
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT hub_id, event_type FROM audit_log WHERE event_type = 'diagnostic_run_failed'"
+    )
+    assert row["hub_id"] == "hub_a"

@@ -2,28 +2,34 @@
 tool-calling loop mechanics shared by every vertical and every client
 agent, unchanged in behavior from the prior DB-driven `run_client_agent`
 — only *how* a vertical's/client's own configuration is supplied has
-changed (real subclass attributes, not database rows). Gathers data
-only — never interprets, diagnoses, or judges what the data means; that
-stays the excluded analysis-job boundary (design.md's Non-Negotiables,
-carried forward unchanged by this change).
+changed (real subclass attributes, not database rows).
+
+`run()` (the gather phase) still only ever gathers data — never
+interprets, diagnoses, or judges what it gathers; that guarantee is
+unchanged and unloosened (vertical-pull-agent's non-negotiable, now
+scoped explicitly to this phase). `diagnose()` (openspec/changes/
+vertical-diagnostic-agent) is a distinct, separately-specified second
+phase that MAY run after `run()` completes, consuming exactly that
+phase's output to produce a real diagnostic narrative — see
+`diagnostics.py`. It has no HubSpot client and no tool access of its
+own; it never changes how the gather phase itself behaves.
 
 Isolation is structural: `HUB_ID` is a class attribute a client subclass
 sets once; the model can never supply or change which tenant a run
 touches, no matter what it decides to call mid-loop.
 """
 
-import json
 from contextlib import AsyncExitStack
 
-import httpx
 import structlog
 from anthropic import AsyncAnthropic
 
 from auth.security import record_audit_best_effort
 from config import settings
-from sync.hubspot_client import CRM_OBJECT_TYPES, HubSpotDataPullClient
+from sync.hubspot_client import HubSpotDataPullClient
 
-from ..store import CONTENT_TYPE_FRAMEWORK, get_latest
+from . import diagnostics
+from .tools import TOOLS, ToolCallBudgetExceeded, bind_tool_executor
 
 logger = structlog.get_logger()
 
@@ -35,72 +41,6 @@ MODEL = "claude-opus-5"
 # CRM_OBJECT_TYPES (16 today), so a real run can check every object type
 # in a single pass without hitting the cap.
 MAX_TOOL_CALLS = 20
-
-_TOOLS = [
-    {
-        "name": "list_object_types",
-        "description": (
-            "List every HubSpot CRM object type this tool surface can pull "
-            "(e.g. CONTACT, COMPANY, DEAL)."
-        ),
-        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    {
-        "name": "pull_object_type",
-        "description": (
-            "Pull every real record of one HubSpot CRM object type for this "
-            "run's tenant, via the existing allowlisted read-only pull path."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "object_type": {
-                    "type": "string",
-                    "enum": CRM_OBJECT_TYPES,
-                    "description": "The CRM object type to pull.",
-                }
-            },
-            "required": ["object_type"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "list_custom_objects",
-        "description": (
-            "List this tenant's real custom object schemas (objectTypeId, name, "
-            "labels), if any. Call this before pull_custom_object — a custom "
-            "object's identifier is tenant-specific and can't be known ahead of "
-            "discovering it here. Returns an empty list on a portal with no "
-            "Custom Objects access, not an error."
-        ),
-        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    {
-        "name": "pull_custom_object",
-        "description": (
-            "Pull every real record of one of this tenant's custom objects, by "
-            "the objectTypeId returned from list_custom_objects."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "object_type_id": {
-                    "type": "string",
-                    "description": "The objectTypeId returned by list_custom_objects.",
-                }
-            },
-            "required": ["object_type_id"],
-            "additionalProperties": False,
-        },
-    },
-]
-
-
-class ToolCallBudgetExceeded(Exception):
-    """Raised internally when a run would exceed its configured max tool
-    calls; caught in run() to stop the loop and return whatever was
-    gathered so far, rather than letting an agent loop or spend
-    unboundedly."""
 
 
 def _render_client_context(confirmed_fields: dict[str, list[str]]) -> str:
@@ -124,6 +64,12 @@ class BaseAgent:
     both are missing HUB_ID, and __init__ refuses to run without one."""
 
     VERTICAL: str = ""
+    # Blu Mountain's own real, delivered vertical framework document,
+    # embedded verbatim as a class attribute by each vertical subclass
+    # (openspec/changes/vertical-framework-content-in-code) — no longer
+    # read from Postgres at request time, so a missing/failed ingestion
+    # step can never leave this empty at runtime.
+    FRAMEWORK_TEXT: str = ""
     SYSTEM_PROMPT_ADDITIONS: str = ""
     MAX_TOOL_CALLS: int = MAX_TOOL_CALLS
     HUB_ID: str = ""
@@ -132,6 +78,11 @@ class BaseAgent:
     # live discovery — never narrower than what's explicitly confirmed,
     # never broader by accident.
     CONFIRMED_FIELDS: dict[str, list[str]] = {}
+    # Optional friendly name for the diagnostic phase's {CLIENT_NAME}
+    # prompt substitution (diagnostics.py). Falls back to HUB_ID when
+    # unset — every existing client class predates this attribute and
+    # none are required to set it.
+    CLIENT_NAME: str = ""
 
     def __init__(self) -> None:
         if not self.HUB_ID:
@@ -141,6 +92,8 @@ class BaseAgent:
             )
         if not self.VERTICAL:
             raise ValueError(f"{type(self).__name__} has no VERTICAL set")
+        if not self.FRAMEWORK_TEXT:
+            raise ValueError(f"{type(self).__name__} has no FRAMEWORK_TEXT set")
         self.hub_id = self.HUB_ID
         self.hs_client = HubSpotDataPullClient(self.hub_id)
 
@@ -148,9 +101,6 @@ class BaseAgent:
         return self.CONFIRMED_FIELDS.get(object_type) or None
 
     async def _system_prompt(self) -> str:
-        framework = await get_latest(CONTENT_TYPE_FRAMEWORK, self.VERTICAL)
-        if framework is None:
-            raise ValueError(f"No stored framework for vertical {self.VERTICAL!r}")
         base = (
             f"You are a data-gathering assistant for a {self.VERTICAL} client's "
             "HubSpot portal. Your only job is deciding which HubSpot CRM object "
@@ -168,86 +118,11 @@ class BaseAgent:
             "framework below mentions other sources (Slack, ClickUp, Harvest, "
             "Toggl, etc.), ignore those references — they are out of scope for "
             "this run and no tool exists to reach them.\n\n"
-            f"--- {self.VERTICAL} framework ---\n{framework.content}"
+            f"--- {self.VERTICAL} framework ---\n{self.FRAMEWORK_TEXT}"
         )
         if self.SYSTEM_PROMPT_ADDITIONS:
             base += f"\n\n--- {self.VERTICAL} agent additions ---\n{self.SYSTEM_PROMPT_ADDITIONS}"
         return base
-
-    def _bind_tool_executor(
-        self,
-        http_client: httpx.AsyncClient | None,
-        headers: dict | None,
-        gathered: dict[str, list],
-        max_tool_calls: int,
-    ):
-        """Returns a tool-execution closure bound to this instance's own
-        hs_client (itself already bound to exactly one hub_id at
-        construction) — the model can never supply a hub_id, or reach any
-        tenant's data besides the one this agent was constructed for."""
-        call_count = 0
-
-        async def _execute(name: str, tool_input: dict) -> str:
-            nonlocal call_count
-            call_count += 1
-            if call_count > max_tool_calls:
-                raise ToolCallBudgetExceeded()
-
-            if name == "list_object_types":
-                return json.dumps(CRM_OBJECT_TYPES)
-
-            if name == "pull_object_type":
-                object_type = tool_input.get("object_type")
-                if object_type not in CRM_OBJECT_TYPES:
-                    return json.dumps({"error": f"unknown object_type {object_type!r}"})
-                confirmed = self._confirmed_fields_for(object_type)
-                if confirmed:
-                    properties_map = {object_type: confirmed}
-                else:
-                    # Falls back to full live discovery — including every
-                    # real custom property this tenant's portal has for
-                    # the type — exactly as before this change, for any
-                    # object type nothing has been confirmed for yet.
-                    discovered = await self.hs_client.discover_object_properties(
-                        object_type, client=http_client, headers=headers
-                    )
-                    properties_map = {object_type: discovered} if discovered else None
-                pulled = await self.hs_client.pull_crm_objects(
-                    object_types=[object_type], properties=properties_map, client=http_client, headers=headers
-                )
-                records = pulled.get(object_type)
-                if isinstance(records, list):
-                    gathered[object_type] = records
-                    return json.dumps({"pulled": len(records)})
-                return json.dumps({"error": str(records)})
-
-            if name == "list_custom_objects":
-                schemas = await self.hs_client.discover_custom_object_schemas(
-                    client=http_client, headers=headers
-                )
-                return json.dumps(schemas)
-
-            if name == "pull_custom_object":
-                object_type_id = tool_input.get("object_type_id")
-                confirmed = self._confirmed_fields_for(object_type_id)
-                if confirmed:
-                    properties = confirmed
-                else:
-                    definitions = await self.hs_client.discover_custom_object_properties(
-                        object_type_id, client=http_client, headers=headers
-                    )
-                    properties = [d["name"] for d in definitions] or None
-                result = await self.hs_client.pull_custom_object(
-                    object_type_id, client=http_client, headers=headers, properties=properties
-                )
-                if isinstance(result, list):
-                    gathered[object_type_id] = result
-                    return json.dumps({"pulled": len(result)})
-                return json.dumps({"error": str(result)})
-
-            return json.dumps({"error": f"unknown tool {name!r}"})
-
-        return _execute
 
     async def run(self) -> dict[str, list]:
         """Runs this agent once. Returns gathered records in the same
@@ -287,13 +162,15 @@ class BaseAgent:
             async with AsyncExitStack() as stack:
                 if http_client is not None:
                     await stack.enter_async_context(http_client)
-                execute_tool = self._bind_tool_executor(http_client, headers, gathered, max_tool_calls)
+                execute_tool = bind_tool_executor(
+                    self.hs_client, self._confirmed_fields_for, http_client, headers, gathered, max_tool_calls
+                )
                 while True:
                     response = await anthropic_client.messages.create(
                         model=MODEL,
                         max_tokens=4096,
                         system=system,
-                        tools=_TOOLS,
+                        tools=TOOLS,
                         messages=messages,
                     )
 
@@ -350,3 +227,36 @@ class BaseAgent:
             },
         )
         return gathered
+
+    async def diagnose(self, gathered: dict[str, list]) -> dict:
+        """Runs the diagnostic phase (openspec/changes/vertical-diagnostic-
+        agent) once, over exactly the records passed in — never re-gathers,
+        never reaches HubSpot itself. `gathered` should ordinarily be this
+        same instance's own `run()` output for the same tenant; nothing
+        here re-validates that, so callers must not pass another tenant's
+        gathered data.
+
+        Returns a diagnostic report dict: {"summary": str, "kpis": [...],
+        "risk_flags": [...]} — see diagnostics.produce_diagnostic_report."""
+        try:
+            report = await diagnostics.produce_diagnostic_report(
+                vertical=self.VERTICAL,
+                framework_text=self.FRAMEWORK_TEXT,
+                client_name=self.CLIENT_NAME or self.HUB_ID,
+                system_prompt_additions=self.SYSTEM_PROMPT_ADDITIONS,
+                gathered=gathered,
+            )
+        except Exception as exc:
+            logger.error(
+                "frameworks.agents.diagnose_failed", hub_id=self.hub_id, vertical=self.VERTICAL, error=str(exc)
+            )
+            await record_audit_best_effort(
+                "diagnostic_run_failed", hub_id=self.hub_id, detail={"vertical": self.VERTICAL, "error": str(exc)}
+            )
+            raise
+
+        logger.info("frameworks.agents.diagnose_completed", hub_id=self.hub_id, vertical=self.VERTICAL)
+        await record_audit_best_effort(
+            "diagnostic_run_completed", hub_id=self.hub_id, detail={"vertical": self.VERTICAL}
+        )
+        return report

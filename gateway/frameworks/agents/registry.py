@@ -49,3 +49,13 @@ def get_registered_agent_class(hub_id: str) -> type[BaseAgent]:
 
 def registered_hub_ids() -> frozenset[str]:
     return frozenset(_REGISTRY.keys())
+
+
+def vertical_for_hub_id(hub_id: str) -> str | None:
+    """Returns the registered client agent class's vertical for hub_id, or
+    None if hub_id has no registered class yet — a tenant can be installed
+    and permitted for a staff member's session without an agent class
+    having been authored for it yet, so callers (e.g. the live session's
+    tenant-listing tool) must not treat this as an error."""
+    cls = _REGISTRY.get(hub_id)
+    return cls.VERTICAL if cls is not None else None

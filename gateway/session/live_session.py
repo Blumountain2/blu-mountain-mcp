@@ -28,7 +28,8 @@ from fastmcp.server.dependencies import get_access_token
 from auth import TENANT_DISPLAY_NAME_SQL, record_audit
 from config import settings
 from db import get_pool
-from sync import HubSpotDataPullClient
+from frameworks.agents.registry import get_registered_agent_class, vertical_for_hub_id
+from sync import HubSpotDataPullClient, stage_diagnostic_report
 from sync.hubspot_client import (
     CATEGORY_CRM_RECORDS,
     CATEGORY_ENGAGEMENT_RECORDS,
@@ -184,7 +185,10 @@ async def _permitted_tenants(staff_identity: str) -> list[dict]:
         """,
         staff_identity,
     )
-    return [{"hub_id": row["hub_id"], "name": row["name"]} for row in rows]
+    return [
+        {"hub_id": row["hub_id"], "name": row["name"], "vertical": vertical_for_hub_id(row["hub_id"])}
+        for row in rows
+    ]
 
 
 def _hub_ids(permitted: list[dict]) -> set[str]:
@@ -289,9 +293,14 @@ async def _audit(staff_identity: str, hub_id: str, event_type: str, detail: dict
 @mcp.tool
 async def list_my_tenants() -> list[dict]:
     """Lists the client tenants this staff member is permitted to query, each
-    as {"hub_id": ..., "name": ...}. name is never blank — it falls back
-    from a human-curated name to HubSpot's own portal domain to the bare
-    hub_id, in that order (see _permitted_tenants)."""
+    as {"hub_id": ..., "name": ..., "vertical": ...}. name is never blank —
+    it falls back from a human-curated name to HubSpot's own portal domain
+    to the bare hub_id, in that order (see _permitted_tenants). vertical is
+    resolved from the registered client agent class for that hub_id
+    (gateway/frameworks/agents/registry.py) and is None for a permitted
+    tenant with no agent class authored yet — not every installed tenant is
+    guaranteed to have one, so this is a normal, non-error case rather than
+    something callers should treat as a failure."""
     email, _session_key = await _require_staff_identity()
     tenants = await _permitted_tenants(email)
     await _audit(email, None, "live_tenants_listed", {"tenant_count": len(tenants)})
@@ -587,6 +596,56 @@ async def query_custom_object(object_type: str, properties: list[str] | None = N
     )
     logger.info("live_session.custom_object_query", staff=email, hub_id=hub_id, object_type_id=object_type_id)
     return {"object_type_id": object_type_id, "records": result}
+
+
+@mcp.tool
+async def run_vertical_diagnostic() -> dict:
+    """Runs the session's selected tenant's registered client agent
+    end-to-end — its gather phase, then its diagnostic phase
+    (openspec/changes/vertical-diagnostic-agent) — and returns a real
+    diagnostic report: {"summary": str, "kpis": [{"name","value","note"}],
+    "risk_flags": [str], "staged": bool}. The report reasons over that
+    tenant's own real HubSpot data against its vertical's stored
+    framework, operational skill, and runtime prompt — never raw records.
+
+    Also stages the same report into Airtable, tagged by client, in this
+    same call. "staged" reports whether that succeeded; a staging failure
+    does not fail this call or discard the report already generated — it
+    is logged and audited distinctly (see live_diagnostic_staging_failed
+    in the audit log), and the caller is told via "staged": False rather
+    than a silent, misleading success.
+
+    Requires a tenant already selected (see select_tenant) when the
+    session has more than one permitted tenant. Fails clearly, naming the
+    missing registration, if the selected tenant has no registered client
+    agent class yet (see list_my_tenants — a tenant with vertical: None
+    has no class registered)."""
+    email, session_key = await _require_staff_identity()
+    hub_id = await _resolve_selected_tenant(email, session_key)
+
+    agent_class = get_registered_agent_class(hub_id)
+    agent = agent_class()
+    gathered = await agent.run()
+    report = await agent.diagnose(gathered)
+
+    staged = True
+    try:
+        await stage_diagnostic_report(hub_id, agent.VERTICAL, report)
+    except Exception as exc:
+        staged = False
+        logger.error("live_session.diagnostic_staging_failed", staff=email, hub_id=hub_id, error=str(exc))
+        await _audit(email, hub_id, "live_diagnostic_staging_failed", {"error": str(exc)})
+
+    await _audit(
+        email,
+        hub_id,
+        "live_diagnostic_report_generated",
+        {"vertical": agent.VERTICAL, "staged": staged},
+    )
+    logger.info(
+        "live_session.diagnostic_report_generated", staff=email, hub_id=hub_id, vertical=agent.VERTICAL, staged=staged
+    )
+    return {**report, "staged": staged}
 
 
 # Prompts return static instruction text only — they never touch the vault,

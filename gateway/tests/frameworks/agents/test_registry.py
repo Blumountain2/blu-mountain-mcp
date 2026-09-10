@@ -60,3 +60,19 @@ def test_re_registering_the_exact_same_class_is_not_an_error():
         HUB_ID = "hub_registry_test_reimport"
 
     register_client_agent("hub_registry_test_reimport")(_Agent)  # no raise
+
+
+def test_vertical_for_hub_id_returns_the_registered_vertical():
+    @register_client_agent("hub_registry_test_vertical")
+    class _Agent(BaseAgent):
+        VERTICAL = "marketplace"
+        HUB_ID = "hub_registry_test_vertical"
+
+    assert registry.vertical_for_hub_id("hub_registry_test_vertical") == "marketplace"
+
+
+def test_vertical_for_hub_id_returns_none_for_an_unregistered_hub_id():
+    # A tenant can be installed and permitted for a staff session before any
+    # agent class has been authored for it — this must not raise, unlike
+    # get_registered_agent_class.
+    assert registry.vertical_for_hub_id("hub_registry_test_unregistered_vertical") is None
